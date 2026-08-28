@@ -17,6 +17,7 @@ test.describe.serial('Private Intake', () => {
     await expect(page.locator('h1')).toHaveCount(1);
     await expect(page.locator('main')).toBeVisible();
     await expect(page.getByRole('img')).toHaveAttribute('alt', /route/i);
+    await expect(page.locator('link[rel="preload"][as="image"]')).toHaveAttribute('fetchpriority', 'high');
     const violations = await new AxeBuilder({ page }).analyze();
     expect(violations.violations.filter((item) => ['serious', 'critical'].includes(item.impact || ''))).toEqual([]);
     expect(consoleErrors).toEqual([]);
@@ -156,5 +157,17 @@ test.describe.serial('Private Intake', () => {
     await page.goto('/worker/not-a-real-ticket');
     await expect(page.getByRole('heading', { name: /brief can’t be opened/ })).toBeVisible();
     expect(errors).toEqual([]);
+  });
+
+  test('uses the offline shell without disconnected API console errors', async ({ page }) => {
+    const errors: string[] = [];
+    page.on('console', (message) => { if (message.type() === 'error') errors.push(message.text()); });
+    await page.goto('/book');
+    await expect(page.getByRole('heading', { name: /Tell the team/ })).toBeVisible();
+    await page.context().setOffline(true);
+    await page.reload();
+    await expect(page.getByRole('heading', { name: /booking desk is unavailable/ })).toBeVisible();
+    expect(errors.filter((message) => /ERR_INTERNET_DISCONNECTED/i.test(message))).toEqual([]);
+    await page.context().setOffline(false);
   });
 });

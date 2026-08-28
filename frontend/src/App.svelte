@@ -28,6 +28,9 @@
   }
 
   async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
+    // Let routes render their explicit offline recovery state without first
+    // issuing a disconnected API request that Chromium reports as an error.
+    if (!navigator.onLine) throw new Error('You’re offline. Reconnect and try again.');
     const headers = new Headers(options.headers);
     headers.set('content-type', 'application/json');
     const license = licenseValid ? localStorage.getItem(LICENSE_KEY) : null;

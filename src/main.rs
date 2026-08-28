@@ -124,6 +124,17 @@ struct SetupInput {
     deletion_days: i64,
 }
 
+/// Owner-controlled initialization for an empty production vault. This stays
+/// distinct from the public setup payload so the bootstrap path can never
+/// become a first-visitor claim route.
+struct BootstrapConfig {
+    business_name: String,
+    passphrase: String,
+    timezone: String,
+    region: String,
+    deletion_days: i64,
+}
+
 #[derive(Deserialize)]
 struct LoginInput {
     passphrase: String,
@@ -1087,6 +1098,27 @@ async fn initialize_workspace_from_env(db: &SqlitePool) -> Result<(), AppError> 
     let Some(passphrase) = env::var("INITIAL_ADMIN_PASSPHRASE").ok() else {
         return Ok(());
     };
+    initialize_workspace_from_bootstrap(
+        db,
+        BootstrapConfig {
+            business_name: env::var("INITIAL_BUSINESS_NAME")
+                .unwrap_or_else(|_| "Private Intake Demo".into()),
+            passphrase,
+            timezone: env::var("INITIAL_TIMEZONE").unwrap_or_else(|_| "UTC".into()),
+            region: env::var("INITIAL_REGION").unwrap_or_else(|_| "United States".into()),
+            deletion_days: env::var("INITIAL_DELETION_DAYS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(30),
+        },
+    )
+    .await
+}
+
+async fn initialize_workspace_from_bootstrap(
+    db: &SqlitePool,
+    config: BootstrapConfig,
+) -> Result<(), AppError> {
     let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspaces")
         .fetch_one(db)
         .await?;
@@ -1094,15 +1126,11 @@ async fn initialize_workspace_from_env(db: &SqlitePool) -> Result<(), AppError> 
         return Ok(());
     }
     let input = SetupInput {
-        business_name: env::var("INITIAL_BUSINESS_NAME")
-            .unwrap_or_else(|_| "Private Intake Demo".into()),
-        passphrase,
-        timezone: env::var("INITIAL_TIMEZONE").unwrap_or_else(|_| "UTC".into()),
-        region: env::var("INITIAL_REGION").unwrap_or_else(|_| "United States".into()),
-        deletion_days: env::var("INITIAL_DELETION_DAYS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(30),
+        business_name: config.business_name,
+        passphrase: config.passphrase,
+        timezone: config.timezone,
+        region: config.region,
+        deletion_days: config.deletion_days,
     };
     validate_setup(&input)?;
     let mut tx = db.begin().await?;
@@ -1341,6 +1369,51 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(AppError::Unauthorized)));
+    }
+
+    #[tokio::test]
+    async fn controlled_bootstrap_initializes_a_working_vault_only_once() {
+        let state = test_state(PathBuf::new()).await;
+        sqlx::migrate!().run(&state.db).await.unwrap();
+        initialize_workspace_from_bootstrap(
+            &state.db,
+            BootstrapConfig {
+                business_name: "Durable Route Repairs".into(),
+                passphrase: "a bootstrap passphrase that is long enough".into(),
+                timezone: "UTC".into(),
+                region: "European Union".into(),
+                deletion_days: 30,
+            },
+        )
+        .await
+        .unwrap();
+
+        let workspace: (String, i64) =
+            sqlx::query_as("SELECT business_name, deletion_days FROM workspaces WHERE id = 1")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(workspace, ("Durable Route Repairs".into(), 30));
+        assert_eq!(load_fields(&state.db).await.unwrap().len(), 8);
+
+        initialize_workspace_from_bootstrap(
+            &state.db,
+            BootstrapConfig {
+                business_name: "Must not replace owner data".into(),
+                passphrase: "another valid bootstrap passphrase".into(),
+                timezone: "UTC".into(),
+                region: "United States".into(),
+                deletion_days: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let business_name: String =
+            sqlx::query_scalar("SELECT business_name FROM workspaces WHERE id = 1")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(business_name, "Durable Route Repairs");
     }
 
     #[tokio::test]
