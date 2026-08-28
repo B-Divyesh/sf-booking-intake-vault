@@ -9,7 +9,7 @@
     "build": "npm run build:web && cargo build --release",
     "test:web": "vitest run --config frontend/vite.config.ts",
     "test:e2e": "playwright test",
-    "test": "npm run test:web && cargo test && npm run test:e2e",
+    "test": "npm run build:web && npm run test:web && cargo test && npm run test:e2e",
     "start": "cargo run --release"
   },
   "dependencies": {

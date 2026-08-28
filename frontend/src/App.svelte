@@ -99,7 +99,7 @@
 {/if}
 
 <main id="main">
-  {#if loading}
+  {#if loading && path === '/admin'}
     <section class="state-screen" aria-busy="true" aria-live="polite">
       <div class="route-loader" aria-hidden="true"><i></i><i></i><i></i></div>
       <h1>Opening the route</h1>
