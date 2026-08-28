@@ -4,3 +4,12 @@ dist/
 *.log
 graphify-out/
 .DS_Store
+node_modules/
+target/
+frontend/dist/
+test-results/
+playwright-report/
+*.db
+*.db-shm
+*.db-wal
+.env
