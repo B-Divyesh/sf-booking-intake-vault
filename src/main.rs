@@ -43,6 +43,8 @@ const LICENSE_HEADER: &str = "x-route-license";
 
 struct AppState {
     db: SqlitePool,
+    database_file: Option<PathBuf>,
+    backup_file: Option<PathBuf>,
     production: bool,
     build_sha: String,
     static_dir: PathBuf,
@@ -246,6 +248,11 @@ async fn main() {
     let db_supplied = env::var_os("DATABASE_URL").is_some();
     let db_url = env::var("DATABASE_URL")
         .unwrap_or_else(|_| "sqlite://private-intake.db?mode=rwc".to_string());
+    let database_file = sqlite_file_path(&db_url);
+    let backup_file = env::var_os("DATABASE_BACKUP_PATH").map(PathBuf::from);
+    restore_database_from_backup(database_file.as_deref(), backup_file.as_deref())
+        .await
+        .expect("database snapshot restore");
     let options = SqliteConnectOptions::from_str(&db_url)
         .expect("valid DATABASE_URL")
         .create_if_missing(true)
@@ -267,6 +274,9 @@ async fn main() {
     initialize_workspace_from_env(&db)
         .await
         .expect("workspace initialization");
+    persist_database_file(database_file.as_deref(), backup_file.as_deref())
+        .await
+        .expect("database snapshot");
     info!(
         database = if db_supplied {
             "supplied"
@@ -283,6 +293,8 @@ async fn main() {
 
     let state = Arc::new(AppState {
         db,
+        database_file,
+        backup_file,
         production,
         build_sha: env::var("BUILD_SHA").unwrap_or_else(|_| "development".to_string()),
         static_dir: PathBuf::from("frontend/dist"),
@@ -345,7 +357,76 @@ fn app(state: Arc<AppState>) -> Router {
 
     api.merge(client_routes)
         .fallback_service(ServeDir::new(state.static_dir.clone()))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            snapshot_after_api_request,
+        ))
         .layer(middleware::from_fn(security_headers))
+}
+
+/// Persist the local SQLite snapshot only after a successful API response. The
+/// deployed single-tenant vault uses local SQLite for correct locking and an
+/// Azure Files copy for revision-to-revision durability.
+async fn snapshot_after_api_request(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let snapshot_needed = request.uri().path().starts_with("/api/");
+    let response = next.run(request).await;
+    if snapshot_needed && response.status().is_success() {
+        if let Err(error) =
+            persist_database_file(state.database_file.as_deref(), state.backup_file.as_deref())
+                .await
+        {
+            error!(kind = "database_snapshot", error = %error, "could not persist vault snapshot");
+        }
+    }
+    response
+}
+
+fn sqlite_file_path(url: &str) -> Option<PathBuf> {
+    let path = url.strip_prefix("sqlite://")?.split('?').next()?;
+    if path == ":memory:" || path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
+async fn restore_database_from_backup(
+    database_file: Option<&std::path::Path>,
+    backup_file: Option<&std::path::Path>,
+) -> Result<(), std::io::Error> {
+    let (Some(database_file), Some(backup_file)) = (database_file, backup_file) else {
+        return Ok(());
+    };
+    if !backup_file.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = database_file.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::copy(backup_file, database_file).await?;
+    Ok(())
+}
+
+async fn persist_database_file(
+    database_file: Option<&std::path::Path>,
+    backup_file: Option<&std::path::Path>,
+) -> Result<(), std::io::Error> {
+    let (Some(database_file), Some(backup_file)) = (database_file, backup_file) else {
+        return Ok(());
+    };
+    if !database_file.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = backup_file.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let pending = backup_file.with_extension("next");
+    tokio::fs::copy(database_file, &pending).await?;
+    tokio::fs::rename(pending, backup_file).await
 }
 
 async fn spa_index(State(state): State<Arc<AppState>>) -> Response {
@@ -1313,6 +1394,8 @@ mod tests {
             .unwrap();
         Arc::new(AppState {
             db,
+            database_file: None,
+            backup_file: None,
             production: false,
             build_sha: "test-build".into(),
             static_dir,
@@ -1449,6 +1532,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(migration_count, 1);
+    }
+
+    #[tokio::test]
+    async fn durable_snapshot_restores_the_last_local_vault_copy() {
+        let directory = env::temp_dir().join(format!("piv-snapshot-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let database = directory.join("vault.db");
+        let backup = directory.join("durable.db");
+        std::fs::write(&database, b"configured vault").unwrap();
+        persist_database_file(Some(&database), Some(&backup))
+            .await
+            .unwrap();
+        std::fs::write(&database, b"replacement content").unwrap();
+        restore_database_from_backup(Some(&database), Some(&backup))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&database).unwrap(), b"configured vault");
     }
 
     #[tokio::test]
