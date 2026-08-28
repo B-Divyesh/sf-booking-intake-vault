@@ -31,7 +31,7 @@ use std::{
     sync::Arc,
     time::{Duration as StdDuration, Instant},
 };
-use tokio::sync::Mutex;
+use tokio::{io::AsyncWriteExt, sync::Mutex};
 use tower_http::{limit::RequestBodyLimitLayer, services::ServeDir};
 use tracing::{error, info, warn};
 
@@ -430,9 +430,10 @@ async fn persist_database_file(
     // Azure Files does not support the atomic rename operation SQLite expects.
     // The database commits locally first; a direct replacement here retains the
     // last complete local file rather than sharing SQLite's lock files.
-    tokio::fs::copy(database_file, backup_file)
-        .await
-        .map(|_| ())
+    let mut source = tokio::fs::File::open(database_file).await?;
+    let mut destination = tokio::fs::File::create(backup_file).await?;
+    tokio::io::copy(&mut source, &mut destination).await?;
+    destination.flush().await
 }
 
 async fn spa_index(State(state): State<Arc<AppState>>) -> Response {
