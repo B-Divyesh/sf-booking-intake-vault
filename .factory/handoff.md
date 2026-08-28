@@ -1,4 +1,23 @@
-# Private Intake — build handoff
+# Private Intake — verification handoff
+
+## Result: FAIL
+
+Independent verification of commit `8b0817b637eeb6daa7bb4b4ead864e975e11e45c`
+against `https://booking-intake-vault.sociobot.in` found release-blocking
+defects. Do not release this candidate unchanged.
+
+- **High:** direct SPA routes (`/book`, `/admin`, `/privacy`, `/terms`, and
+  worker deep links) return HTTP 404 while rendering the SPA body. This emits
+  browser console errors and breaks normal deep-link response semantics.
+- **High:** axe finds a serious 3.83:1 contrast failure for the booking form's
+  `01`/`02`/`03` route-step labels.
+- **Medium:** production `/health` returns `build: "development"`, not the
+  tested commit, so backend deployment identity is unconfirmed.
+
+Full commands, evidence, passing checks, limitations, and retest criteria are
+in `.factory/verification.md`.
+
+## Previous builder handoff (superseded by verification result)
 
 ## Delivered
 
