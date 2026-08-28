@@ -10,7 +10,7 @@ export default defineConfig({
     trace: 'retain-on-failure',
   },
   webServer: {
-    command: "sh -c 'rm -f /tmp/piv-playwright.db && DATABASE_URL=sqlite:///tmp/piv-playwright.db?mode=rwc PORT=8091 cargo run'",
+    command: "sh -c 'rm -f /tmp/piv-playwright.db && BUILD_SHA=playwright-test DATABASE_URL=sqlite:///tmp/piv-playwright.db?mode=rwc PORT=8091 cargo run'",
     url: 'http://127.0.0.1:8091/health',
     reuseExistingServer: false,
     timeout: 120_000,

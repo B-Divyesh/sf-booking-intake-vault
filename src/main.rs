@@ -26,15 +26,13 @@ use std::{
     collections::{HashMap, VecDeque},
     env,
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     str::FromStr,
     sync::Arc,
     time::{Duration as StdDuration, Instant},
 };
 use tokio::sync::Mutex;
-use tower_http::{
-    limit::RequestBodyLimitLayer,
-    services::{ServeDir, ServeFile},
-};
+use tower_http::{limit::RequestBodyLimitLayer, services::ServeDir};
 use tracing::{error, info};
 
 const SESSION_COOKIE: &str = "piv_session";
@@ -44,6 +42,7 @@ struct AppState {
     db: SqlitePool,
     production: bool,
     build_sha: String,
+    static_dir: PathBuf,
     rate_windows: Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
 }
 
@@ -236,6 +235,7 @@ async fn main() {
             .map(|v| v == "production")
             .unwrap_or(false),
         build_sha: env::var("BUILD_SHA").unwrap_or_else(|_| "development".to_string()),
+        static_dir: PathBuf::from("frontend/dist"),
         rate_windows: Mutex::new(HashMap::new()),
     });
     purge_expired(&state.db).await.ok();
@@ -277,9 +277,31 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/api/worker/{token}", get(worker_brief))
         .with_state(state.clone());
 
-    let index = ServeFile::new("frontend/dist/index.html");
-    api.fallback_service(ServeDir::new("frontend/dist").not_found_service(index))
+    // Serve the application shell only for client routes that actually exist.
+    // `ServeDir::not_found_service` keeps a 404 status even when it sends the
+    // index body, which breaks direct visits and refreshes of SPA routes.
+    let client_routes = Router::new()
+        .route("/", get(spa_index))
+        .route("/book", get(spa_index))
+        .route("/admin", get(spa_index))
+        .route("/privacy", get(spa_index))
+        .route("/terms", get(spa_index))
+        .route("/worker/{token}", get(spa_index))
+        .with_state(state.clone());
+
+    api.merge(client_routes)
+        .fallback_service(ServeDir::new(state.static_dir.clone()))
         .layer(middleware::from_fn(security_headers))
+}
+
+async fn spa_index(State(state): State<Arc<AppState>>) -> Response {
+    match tokio::fs::read(state.static_dir.join("index.html")).await {
+        Ok(body) => ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response(),
+        Err(error) => {
+            error!(kind = "static", error = %error, "could not read application shell");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 async fn security_headers(request: Request<Body>, next: Next) -> Response {
@@ -292,6 +314,10 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
     );
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
     headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        "strict-transport-security",
+        HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+    );
     headers.insert(
         "permissions-policy",
         HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
@@ -1013,6 +1039,22 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
+
+    async fn test_state(static_dir: PathBuf) -> Arc<AppState> {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        Arc::new(AppState {
+            db,
+            production: false,
+            build_sha: "test-build".into(),
+            static_dir,
+            rate_windows: Mutex::new(HashMap::new()),
+        })
+    }
 
     fn test_field(visibility: &str) -> FormField {
         FormField {
@@ -1067,5 +1109,52 @@ mod tests {
         assert!(!serde_json::to_string(&brief)
             .unwrap()
             .contains("PRIVATE-CONTEXT"));
+    }
+
+    #[tokio::test]
+    async fn recognized_spa_routes_return_the_shell_with_ok_status() {
+        let static_dir = env::temp_dir().join(format!("piv-spa-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&static_dir).unwrap();
+        std::fs::write(static_dir.join("index.html"), "<main>Private Intake</main>").unwrap();
+        let state = test_state(static_dir.clone()).await;
+
+        for path in [
+            "/",
+            "/book",
+            "/admin",
+            "/privacy",
+            "/terms",
+            "/worker/a-live-token",
+        ] {
+            let response = app(state.clone())
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{path} should be a 200 shell route"
+            );
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "text/html; charset=utf-8"
+            );
+            assert_eq!(
+                response.headers().get("strict-transport-security").unwrap(),
+                "max-age=31536000; includeSubDomains"
+            );
+        }
+
+        let missing_asset = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/does-not-exist.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_asset.status(), StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(static_dir).unwrap();
     }
 }

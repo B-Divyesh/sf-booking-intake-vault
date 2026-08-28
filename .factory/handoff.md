@@ -1,68 +1,87 @@
-# Private Intake — verification handoff
+# Private Intake — repair handoff
 
-## Result: FAIL
+## Result: PASS locally; deployment triggered by push
 
-Independent verification of commit `8b0817b637eeb6daa7bb4b4ead864e975e11e45c`
-against `https://booking-intake-vault.sociobot.in` found release-blocking
-defects. Do not release this candidate unchanged.
+This repair addresses every finding in the independent report for candidate
+`8b0817b637eeb6daa7bb4b4ead864e975e11e45c`.
 
-- **High:** direct SPA routes (`/book`, `/admin`, `/privacy`, `/terms`, and
-  worker deep links) return HTTP 404 while rendering the SPA body. This emits
-  browser console errors and breaks normal deep-link response semantics.
-- **High:** axe finds a serious 3.83:1 contrast failure for the booking form's
-  `01`/`02`/`03` route-step labels.
-- **Medium:** production `/health` returns `build: "development"`, not the
-  tested commit, so backend deployment identity is unconfirmed.
+## Repairs
 
-Full commands, evidence, passing checks, limitations, and retest criteria are
-in `.factory/verification.md`.
+- Direct client routes now receive a real **200** application-shell response:
+  `/`, `/book`, `/admin`, `/privacy`, `/terms`, and `/worker/<token>`. Static
+  assets still use the static-file service and missing assets remain 404. This
+  replaces Axum's `not_found_service(index)`, which returned the index body
+  with a 404 status.
+- Booking form route markers now use `#725914` on `#F4EBD8` (5.62:1), replacing
+  the verifier-reported 3.83:1 `#8B733C` contrast failure.
+- The runtime image accepts the factory `BUILD_SHA` build argument and exports
+  it as `BUILD_SHA`, so `/health` identifies the deployed source commit.
+- Added `Strict-Transport-Security: max-age=31536000; includeSubDomains` to the
+  application response policy. The production edge must preserve this header.
 
-## Previous builder handoff (superseded by verification result)
+## Regression coverage
 
-## Delivered
+- Rust integration regression creates an isolated shell and verifies 200 plus
+  HTML content type for every supported client route, HSTS, and a 404 for a
+  missing asset.
+- Playwright regression verifies all standard direct client documents return
+  200 with no browser console errors, confirms the worker-document response,
+  and asserts `/health` returns its configured build identity.
+- Playwright axe now audits both the landing page and the configured booking
+  form; serious and critical violations must be empty.
 
-- Rust 2021 Axum service with SQLite migrations, structured JSON startup/error logs, secure headers, 64 KB request limit, connection rate limits, graceful shutdown and `/health` build SHA.
-- First-run single-team setup and manager login. Passphrases use Argon2; manager sessions and worker links are stored only as SHA-256 hashes in `HttpOnly`, `SameSite=Strict` flows.
-- Configurable hosted booking form with 2–12 questions and explicit `Worker sees` / `Manager only` routing. The public form schema does not disclose routing metadata.
-- Immutable per-answer visibility snapshots. Admin detail returns the complete record; preview and worker routes issue separate SQL queries restricted to `visibility_snapshot = 'worker'`.
-- Arrival board, status changes, redaction preview, expiring/revocable worker tickets, CSV export, immediate confirmed deletion, and automatic retention purge from 1–90 days.
-- Responsive 390 px booking flow, keyboard focus treatment, empty/loading/error/offline states, print-ready worker ticket, `/privacy`, and `/terms`.
-- Optional one-time US$29 Route pass through the Sociobot checkout/verify contract, with URL token capture, device restore, once-daily verification cache, optimistic offline unlock, and no product ID or provider secret.
-- Original generated art-deco transit artwork, responsive 80 KB/30 KB WebP exports, prompt sidecar, review and provenance in `.factory/design.md`.
-- Versioned shell service worker, immutable asset caching, no third-party runtime scripts/fonts/analytics, and no booking identifiers in application logs.
-- Multi-stage non-root Dockerfile with a persistent `/data` volume.
+## Verification evidence (2026-08-28)
 
-## Verification
-
-Run from `/work/repo`:
+From a clean `npm ci` (74 packages, zero audit vulnerabilities):
 
 ```sh
-npm ci
 npm test
 npm run build
+cargo fmt --check
+git diff --check
+npm audit --audit-level=high
 ```
 
-Verified on 2026-08-28:
+Results:
 
-- `npm test`: 3 Vitest tests, 4 Rust tests and 3 Playwright end-to-end tests passed.
-- End-to-end privacy assertion: manager record contained 8 submitted answers; redaction preview and worker response contained the 5 worker-permitted answers only. Client name, contact number and `PRIVATE BILLING NOTE` were absent from the worker response.
-- Playwright axe: zero serious or critical findings on the landing route; title, one `h1`, main landmark and meaningful hero alt verified.
-- Responsive check: no horizontal overflow at a 390 × 844 viewport.
-- Production bundles: 76.8 KB JavaScript (28.8 KB gzip), 24.0 KB CSS (6.1 KB gzip); hero 80 KB desktop and 30 KB mobile.
-- Lighthouse 12.8.2 mobile against the production build: Performance 100, Accessibility 100, Best Practices 100, SEO 100; LCP 1.6 s, CLS 0, TBT 10 ms.
-- Load smoke: 300 `/health` requests completed successfully in 0.316 s (950 requests/s) on the local container host.
-- `npm audit`: zero known vulnerabilities.
-- `cargo fmt --check`: passed.
+- `npm test` passed: 3 Vitest tests, 5 Rust tests, and 5 Chromium Playwright
+  tests. Browser coverage includes server-enforced worker redaction, direct
+  deep links, title/one-h1/main/hero-alt/console checks, both axe audits, and
+  390 × 844 no-horizontal-overflow.
+- `npm run build` produced `frontend/dist` and
+  `target/release/booking-intake-vault`. Production assets: JS 76,909 bytes
+  (28.87 KB gzip), CSS 24,036 bytes (6.12 KB gzip), mobile hero 29,756 bytes,
+  desktop hero 80,936 bytes.
+- `cargo fmt --check`, `git diff --check`, and `npm audit --audit-level=high`
+  passed. The project has no separate lint/typecheck script; Vite/Svelte
+  production compilation completed cleanly.
+- Native release-server probe with `BUILD_SHA=repair-local`: all six supported
+  client routes returned `200 text/html; charset=utf-8`; a missing asset
+  returned 404; `/health` returned `{"build":"repair-local","status":"ok"}`;
+  unconfigured public form access returned 404. CSP, nosniff, DENY frame,
+  no-referrer, permissions, no-store, and HSTS response policies were present.
+- Offline/update smoke: after service-worker activation on `/book`, a
+  service-worker-controlled offline reload rendered the intentional “The
+  booking desk is unavailable” state without saved booking data.
+- Desktop keyboard smoke: Tab reaches the skip link first with a 3 px focus
+  outline. A 390 px reduced-motion browser had no horizontal overflow and
+  matched `prefers-reduced-motion: reduce`.
+- Privacy smoke: the existing end-to-end booking exercised server-side worker
+  redaction; the worker brief contained permitted address/access values but not
+  the client name or `PRIVATE BILLING NOTE`.
 
-## Build and deploy
+## Build and deployment
 
-The work-order build command is `npm run build`. It produces `frontend/dist/index.html` plus the release server binary at `target/release/booking-intake-vault`. Container deployment uses the repository-root `Dockerfile`, exposes `8080`, runs as `private-intake`, and expects persistent SQLite storage at `/data`.
+The artifact remains a Rust/Axum + SQLite container serving the Vite/Svelte
+build on `PORT` (default 8080). The root `Dockerfile` remains multi-stage and
+non-root. The factory must pass the source commit as `--build-arg BUILD_SHA`;
+the runtime `/health` then returns that exact value. Push the recorded repair
+commit on `main` to trigger the configured container deployment, then confirm
+the public `/health` build field equals that commit and recheck direct links.
 
-Configure `BUILD_SHA`; keep `APP_ENV=production`; mount `/data`; do not put client identifiers in proxy access logs. The product slug is `booking-intake-vault` and the checkout is registered by the factory after handoff.
+## Known limitation
 
-## Known gaps / next steps
-
-- Docker CLI was unavailable in this worker, so the Dockerfile was reviewed but not built locally. Native release compilation exercises the same Rust target and frontend artifacts.
-- The brief describes subscription monetization, while the attached factory billing contract supports one-time license unlocks only. V1 follows that mandatory contract honestly as a US$29 one-time Route pass; no direct payment provider was embedded.
-- This is intentionally a single-tenant SQLite deployment. Horizontal replicas require shared PostgreSQL/session storage and a proxy-aware distributed rate limiter.
-- Calendar sync, payments, dispatch optimization, reminders and CRM remain explicit non-goals.
+Docker CLI is not installed in this worker, so the container image could not
+be built locally. Native release compilation and the release binary's route,
+identity, security-policy, browser, offline, mobile, accessibility, and
+privacy checks all passed.

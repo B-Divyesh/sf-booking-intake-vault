@@ -22,6 +22,28 @@ test.describe.serial('Private Intake', () => {
     expect(consoleErrors).toEqual([]);
   });
 
+  test('returns 200 for every direct client route and exposes its configured build identity', async ({ page }) => {
+    const consoleErrors: string[] = [];
+    page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
+    const health = await page.request.get('/health');
+    expect(health.ok()).toBeTruthy();
+    expect(await health.json()).toEqual({ status: 'ok', build: 'playwright-test' });
+
+    for (const route of ['/', '/book', '/admin', '/privacy', '/terms']) {
+      const response = await page.goto(route);
+      expect(response?.status(), `${route} should serve the application shell`).toBe(200);
+    }
+    const workerDocument = await page.request.get('/worker/nonexistent-token');
+    expect(workerDocument.status()).toBe(200);
+    expect(consoleErrors).toEqual([]);
+  });
+
+  test('has no serious or critical axe violations on the booking form', async ({ page }) => {
+    await page.goto('/book');
+    const violations = await new AxeBuilder({ page }).analyze();
+    expect(violations.violations.filter((item) => ['serious', 'critical'].includes(item.impact || ''))).toEqual([]);
+  });
+
   test('submits an intake and server-redacts the worker brief', async ({ page }) => {
     await page.goto('/book');
     await page.getByLabel(/^Client name/).fill('A PRIVATE CLIENT');

@@ -13,6 +13,7 @@ COPY src ./src
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim AS runtime
+ARG BUILD_SHA=dev
 RUN groupadd --system private-intake && useradd --system --gid private-intake --home-dir /app private-intake \
     && mkdir -p /app/frontend /data \
     && chown -R private-intake:private-intake /app /data
@@ -22,6 +23,7 @@ COPY --from=web-builder /app/frontend/dist ./frontend/dist
 USER private-intake
 ENV PORT=8080 \
     APP_ENV=production \
+    BUILD_SHA=${BUILD_SHA} \
     DATABASE_URL=sqlite:///data/private-intake.db?mode=rwc
 EXPOSE 8080
 VOLUME ["/data"]
