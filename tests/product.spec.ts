@@ -164,6 +164,7 @@ test.describe.serial('Private Intake', () => {
     page.on('console', (message) => { if (message.type() === 'error') errors.push(message.text()); });
     await page.goto('/book');
     await expect(page.getByRole('heading', { name: /Tell the team/ })).toBeVisible();
+    await expect.poll(() => page.evaluate(() => navigator.serviceWorker.controller?.scriptURL || '')).toContain('/sw.js');
     await page.context().setOffline(true);
     await page.reload();
     await expect(page.getByRole('heading', { name: /booking desk is unavailable/ })).toBeVisible();
