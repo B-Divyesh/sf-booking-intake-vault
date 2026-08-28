@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     FromRow, SqlitePool,
 };
 use std::{
@@ -257,6 +257,7 @@ async fn main() {
         .expect("valid DATABASE_URL")
         .create_if_missing(true)
         .busy_timeout(StdDuration::from_secs(30))
+        .journal_mode(SqliteJournalMode::Delete)
         .foreign_keys(true);
     let db = SqlitePoolOptions::new()
         // This is a single-tenant SQLite vault. One writer connection avoids
@@ -274,9 +275,11 @@ async fn main() {
     initialize_workspace_from_env(&db)
         .await
         .expect("workspace initialization");
-    persist_database_file(database_file.as_deref(), backup_file.as_deref())
-        .await
-        .expect("database snapshot");
+    if let Err(error) =
+        persist_database_file(database_file.as_deref(), backup_file.as_deref()).await
+    {
+        warn!(error = %error, "could not persist initial vault snapshot");
+    }
     info!(
         database = if db_supplied {
             "supplied"
@@ -424,9 +427,12 @@ async fn persist_database_file(
     if let Some(parent) = backup_file.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let pending = backup_file.with_extension("next");
-    tokio::fs::copy(database_file, &pending).await?;
-    tokio::fs::rename(pending, backup_file).await
+    // Azure Files does not support the atomic rename operation SQLite expects.
+    // The database commits locally first; a direct replacement here retains the
+    // last complete local file rather than sharing SQLite's lock files.
+    tokio::fs::copy(database_file, backup_file)
+        .await
+        .map(|_| ())
 }
 
 async fn spa_index(State(state): State<Arc<AppState>>) -> Response {
