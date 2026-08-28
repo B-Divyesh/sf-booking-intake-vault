@@ -33,7 +33,7 @@ use std::{
 };
 use tokio::sync::Mutex;
 use tower_http::{limit::RequestBodyLimitLayer, services::ServeDir};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 const SESSION_COOKIE: &str = "piv_session";
 const SESSION_DAYS: i64 = 14;
@@ -249,16 +249,14 @@ async fn main() {
     let options = SqliteConnectOptions::from_str(&db_url)
         .expect("valid DATABASE_URL")
         .create_if_missing(true)
+        .busy_timeout(StdDuration::from_secs(30))
         .foreign_keys(true);
     let db = SqlitePoolOptions::new()
         .max_connections(8)
         .connect_with(options)
         .await
         .expect("database connection");
-    sqlx::migrate!()
-        .run(&db)
-        .await
-        .expect("database migrations");
+    run_migrations(&db).await.expect("database migrations");
 
     let production = env::var("APP_ENV")
         .map(|v| v == "production")
@@ -356,6 +354,25 @@ async fn spa_index(State(state): State<Arc<AppState>>) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// Azure Files may retain SQLite's migration lock briefly as a container
+/// revision starts. Retry the idempotent migration before declaring startup
+/// unhealthy rather than turning that transient storage condition into a
+/// crash loop.
+async fn run_migrations(db: &SqlitePool) -> Result<(), sqlx::migrate::MigrateError> {
+    const ATTEMPTS: u8 = 5;
+    for attempt in 1..=ATTEMPTS {
+        match sqlx::migrate!().run(db).await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < ATTEMPTS => {
+                warn!(attempt, error = %error, "database migration blocked; retrying");
+                tokio::time::sleep(StdDuration::from_secs(u64::from(attempt) * 2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("migration retry loop always returns")
 }
 
 async fn security_headers(request: Request<Body>, next: Next) -> Response {
@@ -1414,6 +1431,22 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(business_name, "Durable Route Repairs");
+    }
+
+    #[tokio::test]
+    async fn startup_migrations_are_safe_to_repeat_for_a_persisted_vault() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_migrations(&db).await.unwrap();
+        run_migrations(&db).await.unwrap();
+        let migration_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(migration_count, 1);
     }
 
     #[tokio::test]
