@@ -1,0 +1,11 @@
+{
+  "slug": "booking-intake-vault",
+  "title": "Private Intake",
+  "territory": "utilities",
+  "user": "Small field-service teams that need a booking form to collect client details while ensuring assigned workers see only the information needed to do the job.",
+  "smallest_useful_product": "Hosted booking form and staff view with field-level roles (admin, assigned worker), a minimal job brief, redaction preview, and deletion date.",
+  "success_measure": "100% of configured private fields are absent from worker views while 90% of workers can open a complete permitted brief before an appointment.",
+  "artifact_class": "web-with-backend",
+  "monetization": "subscription",
+  "constraints": "Server-enforced field-level authorization; minimized PII retention; deletion/export; regional privacy notices; no booking identifiers in logs."
+}

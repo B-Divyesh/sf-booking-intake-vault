@@ -1,0 +1,8 @@
+{
+  "generator": "/opt/fleet/lib/gen-image.sh (factory Azure image deployment)",
+  "date": "2026-08-28",
+  "size": "1536x1024",
+  "quality": "high",
+  "prompt": "Use case: stylized-concept. Asset type: responsive website hero illustration. An elegant 1930s art-deco transit poster as a visual metaphor for privacy-aware field-service booking. A midnight blue geometric station concourse where one intake route cleanly separates into two destinations: a warm lit worker platform with only a tool case and simple work order, and a sealed coral-and-brass manager vault holding private papers. Screen-printed vintage travel poster, crisp geometric architecture, subtle paper grain, restrained flat shapes, premium editorial finish. Landscape 3:2, strong diagonal route, clear focal separation. Palette of midnight navy, warm ivory, aged brass, coral red, muted sea green. Theatrical pools of warm light, calm and trustworthy. Abstract objects only. No people, no readable text, no letters, no numbers, no logos, no watermark, no brands, no gradients, no padlock cliché, no modern device mockups.",
+  "review": "Accepted: coherent deco geometry and route split; no people, text artifacts, brands, seams, or misleading UI."
+}
