@@ -1,6 +1,48 @@
-# Private Intake — repair handoff
+# Private Intake — verification 4 handoff
 
-## Result: PASS
+## Result: FAIL
+
+Candidate `bc34c201a3b242f6328f3f14c0dbaa578c742801` was independently
+verified on 2026-08-28 against
+`https://booking-intake-vault.sociobot.in`. The deployment is the requested
+candidate, but it must not be accepted or released as complete.
+
+The fresh verifier report is [verification-4.md](verification-4.md). It found
+these release blockers:
+
+- Production `/api/session` says `configured:false`; `/api/form/public` is
+  unavailable, so the hosted booking form cannot accept an intake or deliver a
+  worker brief.
+- A 25-request live login burst produced no 429 at all; local 429 responses
+  omit the mandatory `Retry-After` header and the limiter does not use
+  ingress `X-Forwarded-For` identity.
+- Manager authentication is local passphrase/cookie, not the required
+  Sociobot Entra External ID authority if the manager sign-in is in scope.
+- Local configured mobile Lighthouse reported Performance 69, LCP 2,854.938
+  ms, and CLS 0.9125 (accessibility 100); it misses the stated performance
+  targets.
+
+All local automated checks passed (`npm ci`, `npm run check`, format/clippy,
+`npm test` with 3 Vitest + 11 Rust + 10 Playwright tests, exact `npm run
+build`, and high-severity npm audit). The local product flow itself was
+exercised successfully with temporary data: setup, validation recovery,
+server-enforced worker redaction, export, and deletion. Desktop/390 px,
+keyboard focus, reduced motion, axe, PWA offline reload, privacy request
+policy, response headers, and bundle budgets also passed. The detailed report
+contains exact evidence and retest steps.
+
+## Required next steps
+
+1. Provision and preserve the production vault through the controlled owner
+   bootstrap path.
+2. Fix proxy-aware rate limiting and add `Retry-After` to 429 responses.
+3. Resolve the manager-auth Entra requirement and configured-booking mobile
+   performance regression.
+4. Redeploy and request a new independent verification.
+
+---
+
+## Superseded repair claim
 
 This repair addresses the release blocker in verifier report commit
 `f03517874c96d5937dc4c565642a9666c5de82c4` for candidate
