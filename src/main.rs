@@ -252,7 +252,9 @@ async fn main() {
         .busy_timeout(StdDuration::from_secs(30))
         .foreign_keys(true);
     let db = SqlitePoolOptions::new()
-        .max_connections(8)
+        // This is a single-tenant SQLite vault. One writer connection avoids
+        // competing startup/schema locks on durable network-backed storage.
+        .max_connections(1)
         .connect_with(options)
         .await
         .expect("database connection");

@@ -24,7 +24,7 @@ USER private-intake
 ENV PORT=8080 \
     APP_ENV=production \
     BUILD_SHA=${BUILD_SHA} \
-    DATABASE_URL=sqlite:///data/private-intake.db?mode=rwc
+    DATABASE_URL=sqlite:///data/booking-intake-vault.db?mode=rwc
 EXPOSE 8080
 VOLUME ["/data"]
 CMD ["private-intake"]
