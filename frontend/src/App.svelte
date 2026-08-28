@@ -28,7 +28,11 @@
   }
 
   async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
-    const response = await fetch(url, { credentials: 'same-origin', headers: { 'content-type': 'application/json', ...options.headers }, ...options });
+    const headers = new Headers(options.headers);
+    headers.set('content-type', 'application/json');
+    const license = licenseValid ? localStorage.getItem(LICENSE_KEY) : null;
+    if (license) headers.set('x-route-license', license);
+    const response = await fetch(url, { ...options, credentials: 'same-origin', headers });
     const contentType = response.headers.get('content-type') || '';
     const body = contentType.includes('json') ? await response.json() : null;
     if (!response.ok) throw new Error(body?.error || 'The request could not be completed.');
@@ -106,7 +110,7 @@
       <p>Preparing the private intake vault…</p>
     </section>
   {:else if path === '/'}
-    <Landing {navigate} />
+    {@render Landing(navigate)}
   {:else if path === '/book'}
     <BookingFormInner {request} {navigate} state={{}} />
   {:else if path === '/admin'}
@@ -266,7 +270,7 @@
     {@render decoRule()}
     <h2>Your responsibilities</h2><p>You must have a lawful reason to collect submitted information, ask only for what your service needs, configure worker visibility carefully, keep assignment links secure, and respond to data-rights requests.</p>
     <h2>Availability and safety</h2><p>The service is provided as-is. Do not use it as the sole channel for emergencies, medical instructions or safety-critical dispatch. Review the redaction preview before sharing every worker link.</p>
-    <h2>Route pass</h2><p>The optional Route pass is a one-time US$29 purchase that unlocks up to 12 custom questions and longer worker-link choices on this browser. The hosted checkout shows local taxes before payment. Sociobot/Dodo is the merchant of record and handles refund requests; a refund revokes the license automatically. Core export, deletion and accessibility features remain free.</p>
+    <h2>Route pass</h2><p>The optional Route pass is a one-time US$29 purchase that unlocks up to 12 custom questions and longer worker-link choices for this hosted vault. The server verifies the license before saving either upgrade. The hosted checkout shows local taxes before payment. Sociobot/Dodo is the merchant of record and handles refund requests; a refund revokes the license automatically. Core export, deletion and accessibility features remain free.</p>
     <h2>Acceptable use</h2><p>Do not submit illegal content, secrets unrelated to a job, payment card data, health records, or credentials. Do not probe another team’s vault or share a worker link outside the assigned job.</p>
     <h2>Contact</h2><p>Questions about these terms can be sent to <a href="mailto:support@sociobot.in">support@sociobot.in</a>.</p>
   </article>

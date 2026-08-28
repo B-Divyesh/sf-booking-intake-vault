@@ -44,6 +44,38 @@ test.describe.serial('Private Intake', () => {
     expect(violations.violations.filter((item) => ['serious', 'critical'].includes(item.impact || ''))).toEqual([]);
   });
 
+  test('enforces paid limits and typed validation at the API boundary', async ({ page }) => {
+    expect((await page.request.post('/api/login', { data: { passphrase } })).ok()).toBeTruthy();
+    const current = await (await page.request.get('/api/form')).json();
+    const ninth = { id: 'premium_ninth', label: 'Premium ninth', field_type: 'text', required: false, visibility: 'worker', options: [] };
+    const premiumForm = await page.request.put('/api/form', { data: { fields: [...current.fields, ninth] } });
+    expect(premiumForm.status()).toBe(402);
+    expect((await premiumForm.json()).error).toMatch(/valid Route pass/);
+
+    const duplicateFields = current.fields.map((field: Record<string, unknown>, index: number) => index === 1 ? { ...field, id: current.fields[0].id } : field);
+    const duplicate = await page.request.put('/api/form', { data: { fields: duplicateFields } });
+    expect(duplicate.status()).toBe(422);
+    expect((await duplicate.json()).error).toMatch(/unique ID/);
+    expect((await (await page.request.get('/api/form/public')).json()).fields).toHaveLength(8);
+
+    const validValues = {
+      client_name: 'API validation client', contact_number: '+1 555 0199',
+      service_address: '12 Route Road', appointment_date: '2026-09-02',
+      arrival_window: 'Morning · 8–12', job_details: 'Replace valve',
+    };
+    const badDate = await page.request.post('/api/bookings', { data: { values: { ...validValues, appointment_date: 'not-a-date' }, website: '' } });
+    expect(badDate.status()).toBe(422);
+    expect((await badDate.json()).error).toMatch(/valid preferred date/);
+    const badPhone = await page.request.post('/api/bookings', { data: { values: { ...validValues, contact_number: 'not a phone' }, website: '' } });
+    expect(badPhone.status()).toBe(422);
+    expect((await badPhone.json()).error).toMatch(/valid contact number/);
+
+    expect((await page.request.post('/api/bookings', { data: { values: validValues, website: '' } })).status()).toBe(201);
+    const booking = (await (await page.request.get('/api/bookings')).json()).bookings[0];
+    const longLink = await page.request.post(`/api/bookings/${booking.id}/assign`, { data: { worker_name: 'Morgan', expires_hours: 336 } });
+    expect(longLink.status()).toBe(402);
+  });
+
   test('submits an intake and server-redacts the worker brief', async ({ page }) => {
     await page.goto('/book');
     await page.getByLabel(/^Client name/).fill('A PRIVATE CLIENT');
@@ -74,6 +106,29 @@ test.describe.serial('Private Intake', () => {
     await expect(page.locator('main')).toContainText('12 Route Road');
     await expect(page.locator('main')).not.toContainText('PRIVATE BILLING NOTE');
     await expect(page.locator('main')).not.toContainText('A PRIVATE CLIENT');
+    const workerAxe = await new AxeBuilder({ page }).analyze();
+    expect(workerAxe.violations.filter((item) => ['serious', 'critical'].includes(item.impact || ''))).toEqual([]);
+  });
+
+  test('covers manager detail, delete dialog, form routing, and Route pass with axe', async ({ page }) => {
+    expect((await page.request.post('/api/login', { data: { passphrase } })).ok()).toBeTruthy();
+    await page.goto('/admin');
+    await page.getByRole('button', { name: /A PRIVATE CLIENT/ }).click();
+    await page.getByLabel('Job status').selectOption('complete');
+    let result = await new AxeBuilder({ page }).analyze();
+    expect(result.violations.filter((item) => ['serious', 'critical'].includes(item.impact || ''))).toEqual([]);
+    await page.getByRole('button', { name: 'Delete this booking' }).click();
+    result = await new AxeBuilder({ page }).analyze();
+    expect(result.violations.filter((item) => ['serious', 'critical'].includes(item.impact || ''))).toEqual([]);
+    await page.getByRole('button', { name: 'Keep booking' }).click();
+    await page.getByRole('button', { name: /Back to arrivals/ }).click();
+    await page.getByRole('button', { name: 'Form routing' }).click();
+    await page.getByLabel('Answer type').first().selectOption('select');
+    result = await new AxeBuilder({ page }).analyze();
+    expect(result.violations.filter((item) => ['serious', 'critical'].includes(item.impact || ''))).toEqual([]);
+    await page.getByRole('button', { name: /Route pass/ }).click();
+    result = await new AxeBuilder({ page }).analyze();
+    expect(result.violations.filter((item) => ['serious', 'critical'].includes(item.impact || ''))).toEqual([]);
   });
 
   test('fits the client form at 390px without horizontal overflow', async ({ page }) => {
@@ -82,5 +137,24 @@ test.describe.serial('Private Intake', () => {
     await expect(page.getByRole('heading', { name: /Tell the team/ })).toBeVisible();
     const dimensions = await page.evaluate(() => ({ scroll: document.documentElement.scrollWidth, client: document.documentElement.clientWidth }));
     expect(dimensions.scroll).toBeLessThanOrEqual(dimensions.client);
+  });
+
+  test('keeps mobile navigation and legal links at least 44px tall', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    for (const route of ['/', '/privacy', '/terms']) {
+      await page.goto(route);
+      const undersized = await page.locator('a:visible').evaluateAll((links) => links
+        .map((link) => ({ text: (link.textContent || '').trim(), height: link.getBoundingClientRect().height, width: link.getBoundingClientRect().width }))
+        .filter((target) => target.height < 44 || target.width < 44));
+      expect(undersized, `${route} has undersized links`).toEqual([]);
+    }
+  });
+
+  test('renders expected unavailable states without console errors', async ({ page }) => {
+    const errors: string[] = [];
+    page.on('console', (message) => { if (message.type() === 'error') errors.push(message.text()); });
+    await page.goto('/worker/not-a-real-ticket');
+    await expect(page.getByRole('heading', { name: /brief can’t be opened/ })).toBeVisible();
+    expect(errors).toEqual([]);
   });
 });

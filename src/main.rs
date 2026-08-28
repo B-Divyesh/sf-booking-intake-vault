@@ -5,14 +5,14 @@ use argon2::{
 use axum::{
     body::Body,
     extract::{ConnectInfo, DefaultBodyLimit, Path, State},
-    http::{header, HeaderValue, Request, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
 };
 use axum_extra::extract::CookieJar;
-use chrono::{Duration, Utc};
+use chrono::{Duration, NaiveDate, NaiveTime, Utc};
 use rand::{distributions::Alphanumeric, Rng};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ use sqlx::{
     FromRow, SqlitePool,
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
@@ -37,6 +37,9 @@ use tracing::{error, info};
 
 const SESSION_COOKIE: &str = "piv_session";
 const SESSION_DAYS: i64 = 14;
+const FREE_FIELD_LIMIT: usize = 8;
+const FREE_LINK_HOURS: i64 = 48;
+const LICENSE_HEADER: &str = "x-route-license";
 
 struct AppState {
     db: SqlitePool,
@@ -44,6 +47,15 @@ struct AppState {
     build_sha: String,
     static_dir: PathBuf,
     rate_windows: Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
+    license_cache: Mutex<HashMap<String, CachedLicense>>,
+    billing_base: String,
+    http: reqwest::Client,
+}
+
+#[derive(Clone)]
+struct CachedLicense {
+    valid: bool,
+    checked_at: Instant,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +70,8 @@ enum AppError {
     Internal,
     #[error("too many requests")]
     RateLimited,
+    #[error("route pass required")]
+    PaymentRequired,
 }
 
 impl IntoResponse for AppError {
@@ -76,6 +90,10 @@ impl IntoResponse for AppError {
             Self::RateLimited => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "Too many requests from this connection. Wait a minute and try again.".to_string(),
+            ),
+            Self::PaymentRequired => (
+                StatusCode::PAYMENT_REQUIRED,
+                "A valid Route pass is required for more than 8 questions or worker links longer than 48 hours.".to_string(),
             ),
         };
         (status, Json(json!({ "error": message }))).into_response()
@@ -133,6 +151,7 @@ struct PublicField {
 
 #[derive(Serialize)]
 struct PublicForm {
+    available: bool,
     business_name: String,
     region: String,
     deletion_days: i64,
@@ -213,6 +232,7 @@ async fn main() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(8080);
+    let db_supplied = env::var_os("DATABASE_URL").is_some();
     let db_url = env::var("DATABASE_URL")
         .unwrap_or_else(|_| "sqlite://private-intake.db?mode=rwc".to_string());
     let options = SqliteConnectOptions::from_str(&db_url)
@@ -229,14 +249,37 @@ async fn main() {
         .await
         .expect("database migrations");
 
+    let production = env::var("APP_ENV")
+        .map(|v| v == "production")
+        .unwrap_or(false);
+    let bootstrap_supplied = env::var_os("INITIAL_ADMIN_PASSPHRASE").is_some();
+    initialize_workspace_from_env(&db)
+        .await
+        .expect("workspace initialization");
+    info!(
+        database = if db_supplied {
+            "supplied"
+        } else {
+            "generated-default"
+        },
+        bootstrap = if bootstrap_supplied {
+            "supplied"
+        } else {
+            "not-supplied"
+        },
+        "runtime configuration ready"
+    );
+
     let state = Arc::new(AppState {
         db,
-        production: env::var("APP_ENV")
-            .map(|v| v == "production")
-            .unwrap_or(false),
+        production,
         build_sha: env::var("BUILD_SHA").unwrap_or_else(|_| "development".to_string()),
         static_dir: PathBuf::from("frontend/dist"),
         rate_windows: Mutex::new(HashMap::new()),
+        license_cache: Mutex::new(HashMap::new()),
+        billing_base: env::var("BILLING_BASE")
+            .unwrap_or_else(|_| "https://api.sociobot.in/api/v1".to_string()),
+        http: reqwest::Client::new(),
     });
     purge_expired(&state.db).await.ok();
 
@@ -344,6 +387,9 @@ async fn setup(
     Json(input): Json<SetupInput>,
 ) -> Result<Response, AppError> {
     enforce_rate(&state, peer.ip(), 20).await?;
+    if state.production {
+        return Err(AppError::Unauthorized);
+    }
     let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspaces")
         .fetch_one(&state.db)
         .await?;
@@ -425,7 +471,7 @@ async fn session(
         None
     };
     Ok(Json(
-        json!({ "configured": configured, "authenticated": authenticated, "workspace": workspace }),
+        json!({ "configured": configured, "authenticated": authenticated, "setup_allowed": !state.production, "workspace": workspace }),
     ))
 }
 
@@ -441,6 +487,7 @@ async fn admin_form(
 async fn update_form(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: HeaderMap,
     Json(input): Json<FormInput>,
 ) -> Result<Json<Value>, AppError> {
     require_admin(&state, &jar).await?;
@@ -449,34 +496,13 @@ async fn update_form(
             "Keep the form between 2 and 12 fields.".into(),
         ));
     }
-    let allowed = ["text", "email", "tel", "textarea", "date", "time", "select"];
-    let mut tx = state.db.begin().await?;
-    sqlx::query("DELETE FROM form_fields")
-        .execute(&mut *tx)
-        .await?;
+    if input.fields.len() > FREE_FIELD_LIMIT {
+        require_route_pass(&state, &headers).await?;
+    }
+    let mut ids = HashSet::new();
+    let mut prepared = Vec::with_capacity(input.fields.len());
     for (index, field) in input.fields.iter().enumerate() {
-        let label = field.label.trim();
-        if label.len() < 2 || label.len() > 60 {
-            return Err(AppError::Validation(
-                "Every field label must be 2–60 characters.".into(),
-            ));
-        }
-        if !allowed.contains(&field.field_type.as_str()) {
-            return Err(AppError::Validation(
-                "Choose a supported field type.".into(),
-            ));
-        }
-        if field.visibility != "worker" && field.visibility != "admin" {
-            return Err(AppError::Validation(
-                "Choose who can see every field.".into(),
-            ));
-        }
-        let options = field.options.clone().unwrap_or_default();
-        if field.field_type == "select" && options.len() < 2 {
-            return Err(AppError::Validation(format!(
-                "Add at least two choices for {label}."
-            )));
-        }
+        validate_field(field)?;
         let id = field
             .id
             .clone()
@@ -487,6 +513,20 @@ async fn update_form(
                     Utc::now().timestamp_nanos_opt().unwrap_or_default() + index as i64
                 )
             });
+        if !ids.insert(id.clone()) {
+            return Err(AppError::Validation(
+                "Every form field must have a unique ID.".into(),
+            ));
+        }
+        prepared.push((id, field));
+    }
+    let mut tx = state.db.begin().await?;
+    sqlx::query("DELETE FROM form_fields")
+        .execute(&mut *tx)
+        .await?;
+    for (index, (id, field)) in prepared.into_iter().enumerate() {
+        let label = field.label.trim();
+        let options = field.options.clone().unwrap_or_default();
         sqlx::query("INSERT INTO form_fields (id, label, field_type, required, visibility, sort_order, options_json) VALUES (?, ?, ?, ?, ?, ?, ?)")
             .bind(id).bind(label).bind(&field.field_type).bind(field.required).bind(&field.visibility).bind(index as i64)
             .bind(serde_json::to_string(&options).map_err(|_| AppError::Validation("A field choice is invalid.".into()))?)
@@ -496,14 +536,19 @@ async fn update_form(
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn public_form(State(state): State<Arc<AppState>>) -> Result<Json<PublicForm>, AppError> {
+async fn public_form(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
     purge_expired(&state.db).await?;
-    let workspace: Workspace = sqlx::query_as(
+    let workspace: Option<Workspace> = sqlx::query_as(
         "SELECT business_name, timezone, region, deletion_days FROM workspaces WHERE id = 1",
     )
     .fetch_optional(&state.db)
-    .await?
-    .ok_or(AppError::NotFound)?;
+    .await?;
+    let Some(workspace) = workspace else {
+        return Ok(Json(json!({
+            "available": false,
+            "error": "The booking desk has not been configured yet."
+        })));
+    };
     let fields = load_fields(&state.db)
         .await?
         .into_iter()
@@ -515,12 +560,16 @@ async fn public_form(State(state): State<Arc<AppState>>) -> Result<Json<PublicFo
             options: serde_json::from_str(&field.options_json).unwrap_or_default(),
         })
         .collect();
-    Ok(Json(PublicForm {
-        business_name: workspace.business_name,
-        region: workspace.region,
-        deletion_days: workspace.deletion_days,
-        fields,
-    }))
+    Ok(Json(
+        serde_json::to_value(PublicForm {
+            available: true,
+            business_name: workspace.business_name,
+            region: workspace.region,
+            deletion_days: workspace.deletion_days,
+            fields,
+        })
+        .map_err(|_| AppError::Internal)?,
+    ))
 }
 
 async fn create_booking(
@@ -613,6 +662,7 @@ async fn worker_preview(
 async fn assign_worker(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(input): Json<AssignmentInput>,
 ) -> Result<Json<Value>, AppError> {
@@ -627,6 +677,9 @@ async fn assign_worker(
         return Err(AppError::Validation(
             "Worker links can last from 1 hour to 14 days.".into(),
         ));
+    }
+    if input.expires_hours > FREE_LINK_HOURS {
+        require_route_pass(&state, &headers).await?;
     }
     let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bookings WHERE id = ?")
         .bind(&id)
@@ -658,7 +711,7 @@ async fn assign_worker(
 async fn worker_brief(
     State(state): State<Arc<AppState>>,
     Path(token): Path<String>,
-) -> Result<Json<BookingDetail>, AppError> {
+) -> Result<Json<Value>, AppError> {
     purge_expired(&state.db).await?;
     let booking_id: Option<String> = sqlx::query_scalar(
         "SELECT booking_id FROM worker_tokens WHERE token_hash = ? AND expires_at > ?",
@@ -667,8 +720,16 @@ async fn worker_brief(
     .bind(Utc::now().to_rfc3339())
     .fetch_optional(&state.db)
     .await?;
-    let id = booking_id.ok_or(AppError::NotFound)?;
-    load_booking(&state.db, &id, true).await.map(Json)
+    let Some(id) = booking_id else {
+        return Ok(Json(json!({
+            "available": false,
+            "error": "That worker ticket was not found or has expired."
+        })));
+    };
+    let brief = load_booking(&state.db, &id, true).await?;
+    let mut value = serde_json::to_value(brief).map_err(|_| AppError::Internal)?;
+    value["available"] = Value::Bool(true);
+    Ok(Json(value))
 }
 
 async fn update_status(
@@ -890,6 +951,34 @@ fn serialize_admin_fields(fields: Vec<FormField>) -> Vec<Value> {
     })).collect()
 }
 
+fn validate_field(field: &FieldInput) -> Result<(), AppError> {
+    let label = field.label.trim();
+    if label.len() < 2 || label.len() > 60 {
+        return Err(AppError::Validation(
+            "Every field label must be 2–60 characters.".into(),
+        ));
+    }
+    if !["text", "email", "tel", "textarea", "date", "time", "select"]
+        .contains(&field.field_type.as_str())
+    {
+        return Err(AppError::Validation(
+            "Choose a supported field type.".into(),
+        ));
+    }
+    if field.visibility != "worker" && field.visibility != "admin" {
+        return Err(AppError::Validation(
+            "Choose who can see every field.".into(),
+        ));
+    }
+    let options = field.options.as_deref().unwrap_or_default();
+    if field.field_type == "select" && options.len() < 2 {
+        return Err(AppError::Validation(format!(
+            "Add at least two choices for {label}."
+        )));
+    }
+    Ok(())
+}
+
 fn validate_setup(input: &SetupInput) -> Result<(), AppError> {
     if input.business_name.trim().len() < 2 || input.business_name.trim().len() > 80 {
         return Err(AppError::Validation(
@@ -948,6 +1037,40 @@ fn validate_value(field: &FormField, value: &str) -> Result<(), AppError> {
             field.label.to_lowercase()
         )));
     }
+    if field.field_type == "date"
+        && !value.is_empty()
+        && NaiveDate::parse_from_str(value, "%Y-%m-%d").is_err()
+    {
+        return Err(AppError::Validation(format!(
+            "Enter a valid {}.",
+            field.label.to_lowercase()
+        )));
+    }
+    if field.field_type == "time"
+        && !value.is_empty()
+        && NaiveTime::parse_from_str(value, "%H:%M").is_err()
+        && NaiveTime::parse_from_str(value, "%H:%M:%S").is_err()
+    {
+        return Err(AppError::Validation(format!(
+            "Enter a valid {}.",
+            field.label.to_lowercase()
+        )));
+    }
+    if field.field_type == "tel" && !value.is_empty() {
+        let digits = value
+            .chars()
+            .filter(|character| character.is_ascii_digit())
+            .count();
+        let phone_shape = Regex::new(r"^\+?[0-9][0-9 ()\-.]{5,24}$")
+            .expect("phone expression is valid")
+            .is_match(value);
+        if !phone_shape || !(7..=15).contains(&digits) {
+            return Err(AppError::Validation(format!(
+                "Enter a valid {}.",
+                field.label.to_lowercase()
+            )));
+        }
+    }
     if field.field_type == "select" && !value.is_empty() {
         let options: Vec<String> = serde_json::from_str(&field.options_json).unwrap_or_default();
         if !options.iter().any(|item| item == value) {
@@ -958,6 +1081,100 @@ fn validate_value(field: &FormField, value: &str) -> Result<(), AppError> {
         }
     }
     Ok(())
+}
+
+async fn initialize_workspace_from_env(db: &SqlitePool) -> Result<(), AppError> {
+    let Some(passphrase) = env::var("INITIAL_ADMIN_PASSPHRASE").ok() else {
+        return Ok(());
+    };
+    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspaces")
+        .fetch_one(db)
+        .await?;
+    if exists > 0 {
+        return Ok(());
+    }
+    let input = SetupInput {
+        business_name: env::var("INITIAL_BUSINESS_NAME")
+            .unwrap_or_else(|_| "Private Intake Demo".into()),
+        passphrase,
+        timezone: env::var("INITIAL_TIMEZONE").unwrap_or_else(|_| "UTC".into()),
+        region: env::var("INITIAL_REGION").unwrap_or_else(|_| "United States".into()),
+        deletion_days: env::var("INITIAL_DELETION_DAYS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(30),
+    };
+    validate_setup(&input)?;
+    let mut tx = db.begin().await?;
+    let result = sqlx::query("INSERT OR IGNORE INTO workspaces (id, business_name, passphrase_hash, timezone, region, deletion_days, created_at) VALUES (1, ?, ?, ?, ?, ?, ?)")
+        .bind(input.business_name.trim())
+        .bind(hash_passphrase(&input.passphrase)?)
+        .bind(input.timezone.trim())
+        .bind(input.region)
+        .bind(input.deletion_days)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+    if result.rows_affected() == 1 {
+        seed_fields(&mut tx).await?;
+        info!("workspace initialized from supplied bootstrap configuration");
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct LicenseResponse {
+    valid: bool,
+}
+
+async fn require_route_pass(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
+    let token = headers
+        .get(LICENSE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 4096)
+        .ok_or(AppError::PaymentRequired)?;
+    let hash = token_hash(token);
+    if let Some(cached) = state.license_cache.lock().await.get(&hash).cloned() {
+        if cached.checked_at.elapsed() < StdDuration::from_secs(86_400) {
+            return if cached.valid {
+                Ok(())
+            } else {
+                Err(AppError::PaymentRequired)
+            };
+        }
+    }
+    let url = format!(
+        "{}/products/booking-intake-vault/verify",
+        state.billing_base.trim_end_matches('/')
+    );
+    let valid = match state
+        .http
+        .get(url)
+        .query(&[("license", token)])
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => response
+            .json::<LicenseResponse>()
+            .await
+            .map(|result| result.valid)
+            .unwrap_or(false),
+        _ => false,
+    };
+    state.license_cache.lock().await.insert(
+        hash,
+        CachedLicense {
+            valid,
+            checked_at: Instant::now(),
+        },
+    );
+    if valid {
+        Ok(())
+    } else {
+        Err(AppError::PaymentRequired)
+    }
 }
 
 fn hash_passphrase(passphrase: &str) -> Result<String, AppError> {
@@ -1053,6 +1270,9 @@ mod tests {
             build_sha: "test-build".into(),
             static_dir,
             rate_windows: Mutex::new(HashMap::new()),
+            license_cache: Mutex::new(HashMap::new()),
+            billing_base: "http://127.0.0.1:1".into(),
+            http: reqwest::Client::new(),
         })
     }
 
@@ -1075,6 +1295,22 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_malformed_typed_values() {
+        let mut field = test_field("worker");
+        field.field_type = "date".into();
+        assert!(validate_value(&field, "not-a-date").is_err());
+        assert!(validate_value(&field, "2026-09-02").is_ok());
+
+        field.field_type = "time".into();
+        assert!(validate_value(&field, "quarter-past-nine").is_err());
+        assert!(validate_value(&field, "09:15").is_ok());
+
+        field.field_type = "tel".into();
+        assert!(validate_value(&field, "not a phone").is_err());
+        assert!(validate_value(&field, "+1 (555) 019-9000").is_ok());
+    }
+
+    #[test]
     fn tokens_are_never_stored_verbatim() {
         let token = random_token(42);
         assert_ne!(token, token_hash(&token));
@@ -1085,6 +1321,47 @@ mod tests {
     fn ids_allow_only_safe_characters() {
         assert!(valid_id("access_notes-2"));
         assert!(!valid_id("../../token"));
+    }
+
+    #[tokio::test]
+    async fn production_setup_cannot_be_claimed_publicly() {
+        let mut state = test_state(PathBuf::new()).await;
+        sqlx::migrate!().run(&state.db).await.unwrap();
+        Arc::get_mut(&mut state).unwrap().production = true;
+        let result = setup(
+            State(state),
+            ConnectInfo("127.0.0.1:12345".parse().unwrap()),
+            Json(SetupInput {
+                business_name: "Attacker workspace".into(),
+                passphrase: "attacker passphrase".into(),
+                timezone: "UTC".into(),
+                region: "United States".into(),
+                deletion_days: 30,
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::Unauthorized)));
+    }
+
+    #[tokio::test]
+    async fn route_pass_requires_a_token_and_accepts_a_cached_verified_token() {
+        let state = test_state(PathBuf::new()).await;
+        assert!(matches!(
+            require_route_pass(&state, &HeaderMap::new()).await,
+            Err(AppError::PaymentRequired)
+        ));
+
+        let token = "verified-route-pass";
+        state.license_cache.lock().await.insert(
+            token_hash(token),
+            CachedLicense {
+                valid: true,
+                checked_at: Instant::now(),
+            },
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(LICENSE_HEADER, HeaderValue::from_static(token));
+        assert!(require_route_pass(&state, &headers).await.is_ok());
     }
 
     #[tokio::test]

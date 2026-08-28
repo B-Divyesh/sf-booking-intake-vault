@@ -1,5 +1,5 @@
-const CACHE = 'private-intake-shell-v1';
-const SHELL = ['/', '/assets/private-routes-720.webp', '/assets/private-routes-1200.webp'];
+const CACHE = 'private-intake-shell-v2';
+const SHELL = ['/', '/favicon.svg', '/assets/private-routes-720.webp', '/assets/private-routes-1200.webp'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)));

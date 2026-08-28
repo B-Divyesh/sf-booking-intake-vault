@@ -2,12 +2,13 @@
   import { onMount } from 'svelte';
   import { BILLING_BASE, PRODUCT_SLUG, formatDate } from './lib';
   type Workspace = { business_name: string; timezone: string; region: string; deletion_days: number };
-  type Session = { configured: boolean; authenticated: boolean; workspace: Workspace | null };
+  type Session = { configured: boolean; authenticated: boolean; setup_allowed?: boolean; workspace: Workspace | null };
   type Field = { id?: string; label: string; field_type: string; required: boolean; visibility: 'worker' | 'admin'; options: string[] };
   type Item = { field_id: string; label_snapshot: string; visibility_snapshot: 'worker' | 'admin'; value: string; sort_order: number };
   type Booking = { id: string; created_at: string; delete_at: string; status: string; worker_name?: string; summary?: string; responses?: Item[] };
+  type ApiRequest = <T>(url: string, options?: RequestInit) => Promise<T>;
   let { request, session = $bindable(), loadSession, licenseValid, licenseReason, licenseInput = $bindable(), restoreLicense } = $props<{
-    request: <T>(url: string, options?: RequestInit) => Promise<T>; session: Session; loadSession: () => Promise<void>; licenseValid: boolean; licenseReason: string; licenseInput: string; restoreLicense: () => void;
+    request: ApiRequest; session: Session; loadSession: () => Promise<void>; licenseValid: boolean; licenseReason: string; licenseInput: string; restoreLicense: () => void;
   }>();
   let mode = $state<'jobs'|'form'|'pass'>('jobs'); let loading = $state(false); let error = $state(''); let notice = $state('');
   let setup = $state({ business_name: '', passphrase: '', timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC', region: 'United States', deletion_days: 30 });
@@ -15,12 +16,12 @@
   let workerName = $state(''); let linkHours = $state(48); let workerPath = $state(''); let workerExpiry = $state(''); let deleteDialog = $state<HTMLDialogElement>();
 
   async function auth(kind: 'setup'|'login') { error=''; loading=true; try { await request(`/api/${kind}`, { method:'POST', body: JSON.stringify(kind === 'setup' ? setup : { passphrase }) }); await loadSession(); await loadDashboard(); } catch(e){ error=e instanceof Error?e.message:'Could not open the vault.'; } finally{loading=false;} }
-  async function loadDashboard() { if(!session.authenticated) return; loading=true; error=''; try { const [b,f] = await Promise.all([request<{bookings:Booking[]}>('/api/bookings'),request<{fields:Field[]}>('/api/form')]); bookings=b.bookings; fields=f.fields; } catch(e){error=e instanceof Error?e.message:'Could not load the vault.';} finally{loading=false;} }
+  async function loadDashboard() { if(!session.authenticated) return; loading=true; error=''; try { const [b,f] = await Promise.all([request('/api/bookings'),request('/api/form')]) as [{bookings:Booking[]},{fields:Field[]}]; bookings=b.bookings; fields=f.fields; } catch(e){error=e instanceof Error?e.message:'Could not load the vault.';} finally{loading=false;} }
   async function openBooking(id:string) { loading=true; try { selected=await request(`/api/bookings/${id}`); preview=await request(`/api/bookings/${id}/preview`); workerName=selected.worker_name||''; workerPath=''; } catch(e){error=e instanceof Error?e.message:'Could not open this booking.';} finally{loading=false;} }
   async function saveForm() { error=''; notice=''; if(!licenseValid && fields.length>8){error='The free vault supports 8 questions. Remove extra fields or unlock a Route pass.';return;} loading=true; try{await request('/api/form',{method:'PUT',body:JSON.stringify({fields})});notice='Booking form saved. New submissions will use this route.';}catch(e){error=e instanceof Error?e.message:'Could not save the form.';}finally{loading=false;} }
   function addField(){ if(fields.length >= (licenseValid?12:8)){error=licenseValid?'A form can contain up to 12 questions.':'The free vault includes 8 questions. Route pass unlocks 12.';return;} fields=[...fields,{label:'New question',field_type:'text',required:false,visibility:'worker',options:[]}]; }
   function move(index:number,delta:number){const target=index+delta;if(target<0||target>=fields.length)return;const next=[...fields];[next[index],next[target]]=[next[target],next[index]];fields=next;}
-  async function assign(){if(!selected)return;loading=true;error='';try{const result=await request<{worker_path:string;expires_at:string}>(`/api/bookings/${selected.id}/assign`,{method:'POST',body:JSON.stringify({worker_name:workerName,expires_hours:linkHours})});workerPath=result.worker_path;workerExpiry=result.expires_at;await loadDashboard();selected={...selected,worker_name:workerName,status:'assigned'};notice='Worker link created. It can be opened without manager access.';}catch(e){error=e instanceof Error?e.message:'Could not create worker link.';}finally{loading=false;}}
+  async function assign(){if(!selected)return;loading=true;error='';try{const result=await request(`/api/bookings/${selected.id}/assign`,{method:'POST',body:JSON.stringify({worker_name:workerName,expires_hours:linkHours})}) as {worker_path:string;expires_at:string};workerPath=result.worker_path;workerExpiry=result.expires_at;await loadDashboard();selected={...selected,worker_name:workerName,status:'assigned'};notice='Worker link created. It can be opened without manager access.';}catch(e){error=e instanceof Error?e.message:'Could not create worker link.';}finally{loading=false;}}
   async function copyLink(){await navigator.clipboard.writeText(`${location.origin}${workerPath}`);notice='Worker link copied.';}
   async function updateStatus(status:string){if(!selected)return;await request(`/api/bookings/${selected.id}/status`,{method:'PUT',body:JSON.stringify({status})});selected={...selected,status};await loadDashboard();notice='Job status updated.';}
   async function removeBooking(){if(!selected)return;await request(`/api/bookings/${selected.id}`,{method:'DELETE'});deleteDialog?.close();selected=null;preview=null;await loadDashboard();notice='Booking and its worker link were permanently deleted.';}
@@ -28,7 +29,7 @@
   onMount(loadDashboard);
 </script>
 
-{#if !session.configured}
+{#if !session.configured && session.setup_allowed !== false}
   <section class="auth-shell">
     <div class="auth-copy"><p class="eyebrow">Manager vault · first stop</p><h1>Set the rules<br />before details arrive.</h1><p>Create the single manager passphrase, choose a privacy region and set when submissions disappear.</p><ul><li>Passphrase stored as a one-way hash</li><li>Worker links expire automatically</li><li>No booking IDs in application logs</li></ul></div>
     <form onsubmit={(e)=>{e.preventDefault();auth('setup')}} class="paper-form">
@@ -41,6 +42,8 @@
       {#if error}<p class="form-error" role="alert">{error}</p>{/if}<button disabled={loading}>{loading?'Creating vault…':'Create manager vault'}</button>
     </form>
   </section>
+{:else if !session.configured}
+  <section class="state-screen compact" role="status"><p class="eyebrow">Manager vault · controlled setup</p><h1>This vault is awaiting its owner.</h1><p>Production setup is locked. Ask the deployment owner to supply the initial manager configuration.</p></section>
 {:else if !session.authenticated}
   <section class="auth-shell login-shell"><div class="auth-copy"><p class="eyebrow">Manager-only route</p><h1>Return to<br />the vault.</h1><p>Worker assignment links never grant access here.</p></div><form onsubmit={(e)=>{e.preventDefault();auth('login')}} class="paper-form"><h2>Manager sign in</h2><label for="passphrase">Passphrase</label><input id="passphrase" type="password" bind:value={passphrase} required autocomplete="current-password" />{#if error}<p class="form-error" role="alert">{error}</p>{/if}<button disabled={loading}>{loading?'Checking…':'Open the vault'}</button></form></section>
 {:else}

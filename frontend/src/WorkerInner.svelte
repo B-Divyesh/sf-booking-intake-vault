@@ -1,11 +1,12 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { formatDate } from './lib';
-  let { token, request } = $props<{ token: string; request: <T>(url: string, options?: RequestInit) => Promise<T> }>();
+  type ApiRequest = <T>(url: string, options?: RequestInit) => Promise<T>;
+  let { token, request } = $props<{ token: string; request: ApiRequest }>();
   type ResponseItem = { field_id: string; label_snapshot: string; visibility_snapshot: string; value: string; sort_order: number };
-  let brief = $state<{ created_at: string; delete_at: string; status: string; worker_name?: string; responses: ResponseItem[] } | null>(null);
+  let brief = $state<{ available?: boolean; error?: string; created_at: string; delete_at: string; status: string; worker_name?: string; responses: ResponseItem[] } | null>(null);
   let loading = $state(true); let error = $state('');
-  async function load() { loading = true; error = ''; try { brief = await request(`/api/worker/${encodeURIComponent(token)}`); } catch (e) { error = e instanceof Error ? e.message : 'This worker brief is unavailable.'; } finally { loading = false; } }
+  async function load() { loading = true; error = ''; try { const result = await request(`/api/worker/${encodeURIComponent(token)}`) as typeof brief; if (result?.available === false) { brief = null; error = result.error || 'This worker brief is unavailable.'; } else brief = result; } catch (e) { error = e instanceof Error ? e.message : 'This worker brief is unavailable.'; } finally { loading = false; } }
   onMount(load);
 </script>
 

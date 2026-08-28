@@ -1,16 +1,17 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { formatDate } from './lib';
-  let { request, navigate } = $props<{ request: <T>(url: string, options?: RequestInit) => Promise<T>; navigate: (path: string) => void; state: object }>();
+  type ApiRequest = <T>(url: string, options?: RequestInit) => Promise<T>;
+  let { request, navigate } = $props<{ request: ApiRequest; navigate: (path: string) => void; state: object }>();
   type Field = { id: string; label: string; field_type: string; required: boolean; options: string[] };
-  let form = $state<{ business_name: string; region: string; deletion_days: number; fields: Field[] } | null>(null);
+  let form = $state<{ available?: boolean; error?: string; business_name: string; region: string; deletion_days: number; fields: Field[] } | null>(null);
   let values = $state<Record<string, string>>({});
   let error = $state(''); let loading = $state(true); let saving = $state(false); let complete = $state('');
 
-  async function load() { loading = true; error = ''; try { form = await request('/api/form/public'); } catch (e) { error = e instanceof Error ? e.message : 'The form is unavailable.'; } finally { loading = false; } }
+  async function load() { loading = true; error = ''; try { const result = await request('/api/form/public') as typeof form; if (result?.available === false) { form = null; error = result.error || 'The form is unavailable.'; } else form = result; } catch (e) { error = e instanceof Error ? e.message : 'The form is unavailable.'; } finally { loading = false; } }
   async function submit(event: SubmitEvent) {
     event.preventDefault(); error = ''; saving = true;
-    try { const result = await request<{ delete_at: string }>('/api/bookings', { method: 'POST', body: JSON.stringify({ values, website: '' }) }); complete = result.delete_at; }
+    try { const result = await request('/api/bookings', { method: 'POST', body: JSON.stringify({ values, website: '' }) }) as { delete_at: string }; complete = result.delete_at; }
     catch (e) { error = e instanceof Error ? e.message : 'The request could not be sent.'; }
     finally { saving = false; }
   }

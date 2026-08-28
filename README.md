@@ -31,7 +31,7 @@ npm run build:web
 DATABASE_URL='sqlite://private-intake.db?mode=rwc' cargo run
 ```
 
-Open `http://localhost:8080`. The first manager to open `/admin` configures the vault. Use a persistent database file in production; losing that file loses the vault.
+Open `http://localhost:8080`. In local development, the first manager to open `/admin` configures the vault. Production disables public setup and must be initialized with the deployment-only bootstrap variables below. Use a persistent database file in production; losing that file loses the vault.
 
 For frontend hot reload, run the API as above and run `npm run dev` separately. Vite proxies API calls to port 8080.
 
@@ -64,10 +64,15 @@ Runtime configuration is environment-only:
 - `APP_ENV=production` — enables `Secure` on manager session cookies
 - `BUILD_SHA` — returned by `/health` for deployment identification
 - `RUST_LOG` — structured JSON log filter, default `info`
+- `INITIAL_ADMIN_PASSPHRASE` — optional production bootstrap secret; when the database is empty, creates the owner workspace without exposing a public claim endpoint
+- `INITIAL_BUSINESS_NAME`, `INITIAL_TIMEZONE`, `INITIAL_REGION`, `INITIAL_DELETION_DAYS` — optional bootstrap metadata with safe defaults
+- `BILLING_BASE` — optional Sociobot API override for integration testing
+
+The service starts successfully with only `PORT`. For an Internet-facing deployment, supply `INITIAL_ADMIN_PASSPHRASE` as a platform secret before opening the form. Its value is never logged. Once initialized on persistent storage, the bootstrap secret can be removed.
 
 ## Privacy and operations
 
-All private filtering happens in SQL on the server. Public form configuration omits visibility metadata. Worker links are bearer secrets: share them only with the assigned worker and issue a new link if one escapes. Requests are capped at 64 KB and setup, login and public submission endpoints are rate-limited per connection.
+All private filtering happens in SQL on the server. Public form configuration omits visibility metadata. Worker links are bearer secrets: share them only with the assigned worker and issue a new link if one escapes. Paid limits are also enforced by the server using Sociobot license verification; the browser cannot unlock them by itself. Requests are capped at 64 KB and setup, login and public submission endpoints are rate-limited per connection.
 
 The app loads no third-party runtime scripts, fonts or analytics. License verification calls the Sociobot API only when a pass is present. See `/privacy` and `/terms` in the running application.
 
