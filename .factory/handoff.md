@@ -79,6 +79,16 @@ the runtime `/health` then returns that exact value. Push the recorded repair
 commit on `main` to trigger the configured container deployment, then confirm
 the public `/health` build field equals that commit and recheck direct links.
 
+### Live deployment evidence
+
+- Repair commit `3a356064e6cc15de68471d9fb71a13f5f80913f7` was pushed to `main`.
+- Factory ACR build `sf-booking-intake-vault:3a356064e6cc` succeeded with image
+  digest `sha256:d375055c1a72bf4593a5fa92e737598e952f0c44cc75f64a8db3f268ca29186f`.
+- The configured Container App and
+  `https://booking-intake-vault.sociobot.in/health` returned that exact build
+  SHA. Public `/`, `/book`, `/admin`, `/privacy`, and `/terms` each returned
+  HTTP 200 after rollout.
+
 ## Known limitation
 
 Docker CLI is not installed in this worker, so the container image could not
