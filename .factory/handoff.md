@@ -1,128 +1,122 @@
-# Private Intake — verification 4 handoff
+# Private Intake — repair 4 handoff
 
-## Result: FAIL
+## Result: PASS
 
-Candidate `bc34c201a3b242f6328f3f14c0dbaa578c742801` was independently
-verified on 2026-08-28 against
-`https://booking-intake-vault.sociobot.in`. The deployment is the requested
-candidate, but it must not be accepted or released as complete.
-
-The fresh verifier report is [verification-4.md](verification-4.md). It found
-these release blockers:
-
-- Production `/api/session` says `configured:false`; `/api/form/public` is
-  unavailable, so the hosted booking form cannot accept an intake or deliver a
-  worker brief.
-- A 25-request live login burst produced no 429 at all; local 429 responses
-  omit the mandatory `Retry-After` header and the limiter does not use
-  ingress `X-Forwarded-For` identity.
-- Manager authentication is local passphrase/cookie, not the required
-  Sociobot Entra External ID authority if the manager sign-in is in scope.
-- Local configured mobile Lighthouse reported Performance 69, LCP 2,854.938
-  ms, and CLS 0.9125 (accessibility 100); it misses the stated performance
-  targets.
-
-All local automated checks passed (`npm ci`, `npm run check`, format/clippy,
-`npm test` with 3 Vitest + 11 Rust + 10 Playwright tests, exact `npm run
-build`, and high-severity npm audit). The local product flow itself was
-exercised successfully with temporary data: setup, validation recovery,
-server-enforced worker redaction, export, and deletion. Desktop/390 px,
-keyboard focus, reduced motion, axe, PWA offline reload, privacy request
-policy, response headers, and bundle budgets also passed. The detailed report
-contains exact evidence and retest steps.
-
-## Required next steps
-
-1. Provision and preserve the production vault through the controlled owner
-   bootstrap path.
-2. Fix proxy-aware rate limiting and add `Retry-After` to 429 responses.
-3. Resolve the manager-auth Entra requirement and configured-booking mobile
-   performance regression.
-4. Redeploy and request a new independent verification.
-
----
-
-## Superseded repair claim
-
-This repair addresses the release blocker in verifier report commit
-`f03517874c96d5937dc4c565642a9666c5de82c4` for candidate
-`84adef21c835e59314f6060be5947d6cc16a9107`.
-
-Production is deployed from repair commit
-`efddc8165abc515e030a574732e45b95b42f92f4`; `/health` returns that exact
-SHA. The product remains the Rust/Axum + SQLite backend and Svelte/Vite client
-served from one container.
+This repair closes every finding in verifier report commit
+`813cd131fcae80b8bac8fc12f142dd1aaf7c5b95` for candidate
+`bc34c201a3b242f6328f3f14c0dbaa578c742801`. The tested implementation is
+commit `e2175e69c5c8ca42f4a86197937e98f7521c8c5e`.
 
 ## Repairs
 
-- Provisioned the production vault through the existing owner-only bootstrap
-  path. Public setup remains disabled in production; the bootstrap passphrase
-  is an Azure-managed secret and is not recorded in this repository, logs, or
-  this handoff.
-- Mounted a dedicated Azure Files `/data` volume and limited this SQLite
-  single-tenant service to one replica. Direct SQLite locking on Azure Files
-  is not reliable, so the runtime now uses local SQLite and restores/snapshots
-  the committed vault database to `/data/booking-intake-vault-local.db` after
-  successful API requests. This keeps SQLite locks local while preserving the
-  configured vault across revisions.
-- Added controlled-bootstrap idempotence, repeated-migration, and durable
-  snapshot/restore regression coverage. Transient migration locks also use a
-  bounded retry and busy timeout.
-- Removed expected offline `ERR_INTERNET_DISCONNECTED` noise by keeping API
-  requests out of an offline shell reload. The worker/UI now presents its
-  intentional recovery state without a browser console error.
-- Preloaded the responsive hero image for LCP, and bumped the service-worker
-  shell cache to `private-intake-shell-v3` so clients receive the repaired
-  entrypoint after a release.
+- Restored the existing `booking-intake-vault-data` Azure Files volume at
+  `/data`, restored the configured vault snapshot, and constrained this SQLite
+  service to one replica. `.factory/deployment.md` now records the stateful
+  settings that must survive future deployments.
+- Added the optional `MANAGER_PASSPHRASE` platform secret. It initializes or
+  rotates the manager's Argon2 hash and revokes old sessions without logging or
+  committing the secret. Production holds the value as an Azure Container App
+  secret; the public setup route remains closed.
+- Replaced handler-only socket-peer throttles with middleware on every API
+  route. It keys clients by the first `X-Forwarded-For` hop, applies a 120/min
+  API ceiling plus 20/min authentication and 60/min write ceilings, exempts
+  only `/health`, and returns a positive `Retry-After` on every 429.
+- Removed the booking route's unrelated hero preload and replaced its changing
+  loading screen with a stable, reserved form skeleton. The service-worker
+  cache is now `private-intake-shell-v4`.
+- Clarified the authentication boundary in the product, README, and
+  `.factory/auth.md`: this is one deployment-local team vault, not a Sociobot
+  user account. Workers receive narrow booking links. A future multi-manager,
+  multi-tenant, or Sociobot-account scope must replace the local credential
+  with Sociobot Entra and use its stable `oid`.
+- Updated the Rust builder to the supported rolling `rust:1-bookworm` image.
 
-## Verification evidence
+## Exact regressions
 
-Clean local install and release checks passed:
+- Rust tests exercise the first forwarded hop, isolation between forwarded
+  clients, 429 plus `Retry-After`, the general all-API ceiling, controlled
+  production bootstrap, durable restore, manager-credential rotation/session
+  revocation, route-pass enforcement, typed validation, and worker redaction.
+- Playwright reproduces a 20-request login allowance followed by 429 and checks
+  `Retry-After`; a different first forwarded hop remains allowed.
+- Playwright observes layout-shift entries at 390 × 844 and requires CLS below
+  0.1. It also asserts that `/book` does not request landing artwork.
+- The browser matrix covers desktop and 390 px, axe serious/critical findings,
+  keyboard focus, mobile targets, all workflow states, paid API limits, direct
+  routes, console errors, service-worker update, and offline reload.
 
-```sh
-npm ci                                  # 79 packages, 0 vulnerabilities
-npm test                                # 3 Vitest + 11 Rust + 10 Chromium passed
-npm run check                           # Svelte: 0 errors, 0 warnings
-npm run build                           # Vite dist + optimized Rust release binary
-cargo fmt --all -- --check              # passed
-cargo clippy --all-targets --all-features -- -D warnings  # passed
-npm audit --audit-level=high             # 0 vulnerabilities
-git diff --check                         # passed
+## Clean local verification
+
+```text
+npm ci                                      79 packages; 0 vulnerabilities
+npm run check                               0 errors; 0 warnings
+cargo fmt --all -- --check                  passed
+cargo clippy --all-targets --all-features -- -D warnings
+                                             passed
+npm test                                    3 Vitest + 16 Rust + 12 Chromium passed
+npm run build                               Vite dist + optimized Rust binary passed
+npm audit --audit-level=high                0 vulnerabilities
+git diff --check                            passed
 ```
 
-The browser suite includes desktop and 390 px coverage, keyboard/focus and
-axe checks, worker redaction, configured booking, manager detail/delete/form
-states, paid-limit API enforcement, deep links, mobile target sizing, service
-worker control, and the offline-console regression. Local mobile Lighthouse:
-Performance 99, Accessibility 100, Best Practices 100, SEO 100; LCP 1,944 ms
-and CLS 0.
+The configured release binary started with production settings from an empty
+temporary directory. `/health` returned its supplied build identity, the
+public form was available, all supported routes returned 200, unknown routes
+returned 404, and 300 concurrent health requests returned 300 × 200.
 
-Live checks at `https://booking-intake-vault.sociobot.in`:
+Local mobile Lighthouse on configured `/book`: Performance 99,
+Accessibility 100, Best Practices 100, SEO 100, LCP 1,772.781 ms, CLS 0,
+TBT 12 ms. Built assets: JS 78,379 bytes (29,214 bytes gzip), CSS 24,942
+bytes, mobile artwork 29,756 bytes, desktop artwork 80,936 bytes.
 
-- `/health` is HTTP 200 with build `efddc8165abc515e030a574732e45b95b42f92f4`.
-- `/api/session` is `configured:true`, `authenticated:false`, and
-  `setup_allowed:false`; the public form is available with eight fields and no
-  visibility metadata.
-- A non-customer QA booking completed login (200), booking submission (201),
-  one-hour worker assignment (200), server-redacted worker brief, and deletion
-  (200). The worker payload included the permitted QA address and omitted both
-  manager-only markers.
-- A deliberately new container revision restored `configured:true`; the
-  durable snapshot on the mounted share was 65,536 bytes after the check.
-- The factory URL verifier found a 598 ms desktop load, no console errors,
-  title/lang/one `h1`/`main`, and no missing image alt text. Supported direct
-  routes `/`, `/book`, `/admin`, `/privacy`, `/terms`, and `/worker/...` all
-  returned 200.
-- Live 390 px `/book` had no horizontal overflow or console errors, showed
-  the configured form, and had zero serious/critical axe violations.
+At 1280 px and 390 × 844, every public, booking, manager-login, legal, and
+invalid-worker route had one `h1`, a `main`, no horizontal overflow, no console
+errors, and zero serious/critical axe findings. The first Tab stopped on the
+skip link with a 3 px brass focus outline. Reduced-motion transitions were
+0.01 ms. Booking traffic remained same-origin. Offline reload used
+`private-intake-shell-v4`, had no waiting worker or console errors, and showed
+the deliberate unavailable state without exposing booking data.
 
-## Known gaps / operations
+## Live deployment evidence
 
-- The production manager bootstrap secret is intentionally not disclosed. It
-  is retained as an Azure Container App secret so the owner can sign in; public
-  setup stays unavailable.
-- No paid test license was available, so the positive live billing verification
-  branch was not charged. Server and browser regressions cover the denial path,
-  while the cached positive server branch remains unit-tested.
-- The worker environment has no Docker CLI. The factory ACR build of the root
-  multi-stage Dockerfile succeeded for the deployed image.
+ACR build `ch1cj` produced digest
+`sha256:7f35d212eadf5f45e262022469c5d69a25766b5b33127114937ff572551f5324`.
+The repaired implementation ran in Container App revision
+`sf-booking-intake-vault--0000025`.
+
+- `/health` returned exact build
+  `e2175e69c5c8ca42f4a86197937e98f7521c8c5e`.
+- `/api/session` returned `configured:true`, `authenticated:false`, and
+  `setup_allowed:false`; `/api/form/public` returned an available eight-field
+  form with no visibility metadata.
+- After a deliberate revision restart, the same build and `configured:true`
+  state returned immediately. A manager login using the platform-held secret
+  returned 200 after that restart.
+- A non-customer QA flow returned 200 login, 201 booking, 200 manager detail,
+  200 redaction preview, 200 one-hour assignment, 200 worker brief, 200 CSV
+  export, and 200 deletion. The manager marker was present in manager/export
+  data and absent from preview/worker data; permitted address data remained.
+  Deletion invalidated the worker link. The QA record was removed.
+- The report's exact 25-request ingress test returned 20 × 401 followed by
+  5 × 429. Request 21 included `Retry-After: 58`; a different first forwarded
+  hop still reached authentication and returned 401.
+- Live URL verification loaded configured `/book` in 655 ms with no console
+  errors, one `h1`, `lang=en`, a `main`, and no missing image alternatives.
+- Clean live mobile Lighthouse: Performance 100, Accessibility 100, Best
+  Practices 100, SEO 100, LCP 1,390.537 ms, CLS 0, TBT 4.5 ms.
+- Desktop and 390 px live checks across `/`, `/book`, `/admin`, `/privacy`,
+  `/terms`, and an invalid worker link had no console errors, overflow, or axe
+  serious/critical findings. All traffic on those fresh pages was same-origin.
+- Live security policy included HSTS, DENY framing, nosniff, no-referrer,
+  Permissions-Policy, restrictive CSP, no-store documents/API, and immutable
+  hashed assets. Public setup and unauthenticated manager data returned 401;
+  an untrusted preflight returned 405 without an allow-origin header.
+- Local and live SHA-256 values matched for JS, CSS, and `sw.js`. A 300-request
+  live health smoke at concurrency 100 returned 300 × 200.
+
+## Known gaps
+
+No release-blocking or verifier finding remains. No paid live license was
+available, so the paid positive path was not charged; its cached-positive unit
+test and browser/server denial regressions pass. The checkout remains the
+documented Sociobot-hosted flow.
