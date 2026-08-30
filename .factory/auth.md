@@ -1,13 +1,18 @@
 # Authentication boundary
 
-Private Intake is a single-team, single-vault installation. It does not create
-Sociobot users, synchronize accounts, or expose shared account data across
-products. One deployment-local manager passphrase opens the manager surface;
-workers receive a narrow, expiring link for one booking. The passphrase,
-sessions, and worker-link tokens are stored only as one-way hashes.
+Manager access uses only the shared Sociobot Microsoft Entra External ID tenant:
 
-Sociobot Entra External ID is therefore not an authority for this v1 product.
-If the scope grows to multiple managers, multiple tenants, or Sociobot account
-membership, the local credential must be replaced by Entra and users must be
-keyed by the stable `oid` claim. This boundary is stated on the sign-in screen
-so a manager cannot mistake the vault credential for a Sociobot account.
+- Authority: `https://sociobotcustomers.ciamlogin.com/35c6fe40-0ec0-46b6-98c6-213ad4de6650/`
+- Public client ID: `25c704f4-465a-47af-80ab-2c489466b697`
+- Claims checked by the server: RS256 signature, discovery issuer, JWKS key,
+  client audience, tenant ID, expiry/not-before, and non-empty stable `oid`
+- Browser cache: MSAL session storage; no local manager password exists
+
+The first valid Entra identity claims a new single-team vault. The stored `oid`
+must match for every later manager request. Other identities receive 403.
+Workers do not sign in. They receive one narrow, random, expiring link whose
+token is stored only as a SHA-256 hash.
+
+`TEST_ENTRA_OID` and `X-Test-Oid` provide deterministic browser automation only.
+The header is ignored by production binaries unless the exact environment
+switch is explicitly present; deployed revisions do not set it.

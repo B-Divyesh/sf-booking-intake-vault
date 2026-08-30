@@ -51,3 +51,5 @@ Prompt sheet:
 - Generator: factory Azure image deployment via `/opt/fleet/lib/gen-image.sh`.
 - Date: 2026-08-28.
 - License/provenance: original AI-generated artwork commissioned for this product; no source image, brand or copyrighted character used. Prompt sidecar retained under `assets/src/`.
+- The 1200×630 social card is a center crop of the original 1200 px hero.
+- The 180 px touch icon is a hand-authored geometric mark using the documented midnight and brass palette.

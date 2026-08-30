@@ -26,12 +26,15 @@
     </div>
   </section>
 {:else if error && !form}
-  <section class="state-screen compact" role="alert"><p class="eyebrow">Route interrupted</p><h1>The booking desk is unavailable</h1><p>{error}</p><button onclick={load}>Try again</button></section>
+  <section class="form-shell booking-route unavailable-booking" role="alert">
+    <div class="form-intro"><p class="eyebrow">Booking request</p><h1>The booking desk is unavailable</h1><p>{error}</p></div>
+    <div class="paper-form booking-error-panel"><h2>Try the connection again</h2><p>The booking questions could not be loaded. No details have been entered or sent.</p><button onclick={load}>Try again</button></div>
+  </section>
 {:else if complete}
   <section class="confirmation">
     <span class="confirmation-mark" aria-hidden="true">✓</span><p class="eyebrow">Request received</p><h1>Your details reached the manager.</h1>
     <p>The team can now prepare the right brief for the assigned worker. Your submission is scheduled for deletion on <strong>{formatDate(complete)}</strong>.</p>
-    <div class="ticket-stub"><span>Private by route</span><strong>Only approved job details travel onward</strong></div>
+    <div class="ticket-stub"><span>Private by default</span><strong>Only approved job details reach the worker</strong></div>
     <button class="secondary" onclick={() => navigate('/')}>Return to Private Intake</button>
   </section>
 {:else if form}
@@ -53,7 +56,7 @@
       {/each}
       <div class="honeypot" aria-hidden="true"><label for="website">Website</label><input id="website" tabindex="-1" autocomplete="off" /></div>
       {#if error}<p class="form-error" role="alert">{error}</p>{/if}
-      <aside class="privacy-note"><span aria-hidden="true">◆</span><div><strong>Details travel on separate routes.</strong><p>Retained for {form.deletion_days} days, then deleted. Only job and access details reach a worker; private context remains with the manager. Regional notice: {form.region}.</p></div></aside>
+      <aside class="privacy-note"><span aria-hidden="true">◆</span><div><strong>Your details have two visibility levels.</strong><p>Retained for {form.deletion_days} days, then deleted. Only job and access details reach a worker; private context remains with the manager. Regional notice: {form.region}.</p></div></aside>
       <button type="submit" disabled={saving}>{saving ? 'Sending securely…' : 'Send booking request'} <span aria-hidden="true">→</span></button>
     </form>
   </section>

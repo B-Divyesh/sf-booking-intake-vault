@@ -1,7 +1,5 @@
-use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-    Argon2,
-};
+mod auth;
+
 use axum::{
     body::Body,
     extract::{ConnectInfo, DefaultBodyLimit, Path, State},
@@ -11,7 +9,6 @@ use axum::{
     routing::{get, post, put},
     Json, Router,
 };
-use axum_extra::extract::CookieJar;
 use chrono::{Duration, NaiveDate, NaiveTime, Utc};
 use rand::{distributions::Alphanumeric, Rng};
 use regex::Regex;
@@ -32,11 +29,12 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 use tokio::{io::AsyncWriteExt, sync::Mutex};
-use tower_http::{limit::RequestBodyLimitLayer, services::ServeDir};
+use tower_http::{
+    limit::RequestBodyLimitLayer,
+    services::{ServeDir, ServeFile},
+};
 use tracing::{error, info, warn};
 
-const SESSION_COOKIE: &str = "piv_session";
-const SESSION_DAYS: i64 = 14;
 const FREE_FIELD_LIMIT: usize = 8;
 const FREE_LINK_HOURS: i64 = 48;
 const LICENSE_HEADER: &str = "x-route-license";
@@ -56,13 +54,14 @@ struct AppState {
     db: SqlitePool,
     database_file: Option<PathBuf>,
     backup_file: Option<PathBuf>,
-    production: bool,
     build_sha: String,
     static_dir: PathBuf,
     rate_windows: Mutex<HashMap<(IpAddr, RateClass), VecDeque<Instant>>>,
     license_cache: Mutex<HashMap<String, CachedLicense>>,
     billing_base: String,
     http: reqwest::Client,
+    entra: auth::EntraValidator,
+    demos: Mutex<HashMap<String, DemoWorkspace>>,
 }
 
 #[derive(Clone)]
@@ -75,6 +74,8 @@ struct CachedLicense {
 enum AppError {
     #[error("not signed in")]
     Unauthorized,
+    #[error("forbidden")]
+    Forbidden,
     #[error("not found")]
     NotFound,
     #[error("{0}")]
@@ -92,7 +93,12 @@ impl IntoResponse for AppError {
         let (status, message, retry_after) = match self {
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
-                "Sign in to continue.".to_string(),
+                "Sign in with your Sociobot account to continue.".to_string(),
+                None,
+            ),
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "This vault belongs to another Sociobot account.".to_string(),
                 None,
             ),
             Self::NotFound => (
@@ -144,29 +150,11 @@ struct Workspace {
     deletion_days: i64,
 }
 
-#[derive(Deserialize)]
-struct SetupInput {
-    business_name: String,
-    passphrase: String,
-    timezone: String,
-    region: String,
-    deletion_days: i64,
-}
-
-/// Owner-controlled initialization for an empty production vault. This stays
-/// distinct from the public setup payload so the bootstrap path can never
-/// become a first-visitor claim route.
 struct BootstrapConfig {
     business_name: String,
-    passphrase: String,
     timezone: String,
     region: String,
     deletion_days: i64,
-}
-
-#[derive(Deserialize)]
-struct LoginInput {
-    passphrase: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -259,6 +247,18 @@ struct StatusInput {
     status: String,
 }
 
+#[derive(Clone, Serialize)]
+struct DemoWorkspace {
+    id: String,
+    created_at: String,
+    expires_at: String,
+    delete_at: String,
+    worker_name: String,
+    status: String,
+    manager_responses: Vec<ResponseRow>,
+    worker_responses: Vec<ResponseRow>,
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -295,19 +295,17 @@ async fn main() {
         .expect("database connection");
     run_migrations(&db).await.expect("database migrations");
 
-    let production = env::var("APP_ENV")
-        .map(|v| v == "production")
-        .unwrap_or(false);
-    let bootstrap_supplied = env::var_os("INITIAL_ADMIN_PASSPHRASE").is_some();
-    let manager_passphrase = env::var("MANAGER_PASSPHRASE").ok();
-    initialize_workspace_from_env(&db)
+    let bootstrap_overridden = [
+        "INITIAL_BUSINESS_NAME",
+        "INITIAL_TIMEZONE",
+        "INITIAL_REGION",
+        "INITIAL_DELETION_DAYS",
+    ]
+    .iter()
+    .any(|key| env::var_os(key).is_some());
+    initialize_default_workspace(&db)
         .await
         .expect("workspace initialization");
-    if let Some(passphrase) = manager_passphrase.as_deref() {
-        apply_manager_passphrase(&db, passphrase)
-            .await
-            .expect("manager credential override");
-    }
     if let Err(error) =
         persist_database_file(database_file.as_deref(), backup_file.as_deref()).await
     {
@@ -319,37 +317,37 @@ async fn main() {
         } else {
             "generated-default"
         },
-        bootstrap = if bootstrap_supplied {
-            "supplied"
+        workspace_defaults = if bootstrap_overridden {
+            "overridden"
         } else {
-            "not-supplied"
+            "generated-default"
         },
-        manager_credential = if manager_passphrase.is_some() {
-            "supplied"
-        } else {
-            "not-supplied"
-        },
+        identity = "Sociobot Entra defaults",
         "runtime configuration ready"
     );
 
+    let http = reqwest::Client::new();
     let state = Arc::new(AppState {
         db,
         database_file,
         backup_file,
-        production,
         build_sha: env::var("BUILD_SHA").unwrap_or_else(|_| "development".to_string()),
         static_dir: PathBuf::from("frontend/dist"),
         rate_windows: Mutex::new(HashMap::new()),
         license_cache: Mutex::new(HashMap::new()),
         billing_base: env::var("BILLING_BASE")
             .unwrap_or_else(|_| "https://api.sociobot.in/api/v1".to_string()),
-        http: reqwest::Client::new(),
+        entra: auth::EntraValidator::from_environment(http.clone()),
+        http,
+        demos: Mutex::new(HashMap::new()),
     });
+    info!(
+        identity_authority = state.entra.authority(),
+        "Sociobot Entra identity validation ready"
+    );
     purge_expired(&state.db).await.ok();
 
-    let app = app(state)
-        .layer(DefaultBodyLimit::disable())
-        .layer(RequestBodyLimitLayer::new(64 * 1024));
+    let app = app(state);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .expect("port is available");
@@ -365,9 +363,6 @@ async fn main() {
 
 fn app(state: Arc<AppState>) -> Router {
     let api = Router::new()
-        .route("/api/setup", post(setup))
-        .route("/api/login", post(login))
-        .route("/api/logout", post(logout))
         .route("/api/session", get(session))
         .route("/api/form", get(admin_form).put(update_form))
         .route("/api/form/public", get(public_form))
@@ -381,6 +376,16 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/api/bookings/{id}/assign", post(assign_worker))
         .route("/api/bookings/{id}/status", put(update_status))
         .route("/api/worker/{token}", get(worker_brief))
+        .route("/api/demo/workspaces", post(create_demo_workspace))
+        .route("/api/demo/workspaces/{id}", get(get_demo_workspace))
+        .route(
+            "/api/demo/workspaces/{id}/reset",
+            post(reset_demo_workspace),
+        )
+        .route(
+            "/api/demo/workspaces/{id}/export.csv",
+            get(export_demo_workspace),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             rate_limit_api,
@@ -392,20 +397,40 @@ fn app(state: Arc<AppState>) -> Router {
     let client_routes = Router::new()
         .route("/", get(spa_index))
         .route("/book", get(spa_index))
+        .route("/demo", get(spa_index))
         .route("/admin", get(spa_index))
+        .route("/auth/callback", get(spa_index))
         .route("/privacy", get(spa_index))
         .route("/terms", get(spa_index))
         .route("/worker/{token}", get(spa_index));
 
+    let static_dir = state.static_dir.clone();
     Router::new()
         .route("/health", get(health))
         .merge(api)
         .merge(client_routes)
-        .fallback_service(ServeDir::new(state.static_dir.clone()))
+        .nest_service("/assets", ServeDir::new(static_dir.join("assets")))
+        .route_service(
+            "/favicon.svg",
+            ServeFile::new(static_dir.join("favicon.svg")),
+        )
+        .route_service(
+            "/apple-touch-icon.png",
+            ServeFile::new(static_dir.join("apple-touch-icon.png")),
+        )
+        .route_service("/sw.js", ServeFile::new(static_dir.join("sw.js")))
+        .route_service("/robots.txt", ServeFile::new(static_dir.join("robots.txt")))
+        .route_service(
+            "/sitemap.xml",
+            ServeFile::new(static_dir.join("sitemap.xml")),
+        )
+        .fallback(spa_not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             snapshot_after_api_request,
         ))
+        .layer(DefaultBodyLimit::disable())
+        .layer(RequestBodyLimitLayer::new(64 * 1024))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
 }
@@ -425,7 +450,7 @@ async fn rate_limit_api(
     }
 
     let path = request.uri().path();
-    let scoped_limit = if matches!(path, "/api/setup" | "/api/login") {
+    let scoped_limit = if path == "/api/session" {
         Some((RateClass::Auth, AUTH_RATE_LIMIT))
     } else if request.method() != axum::http::Method::GET
         && request.method() != axum::http::Method::HEAD
@@ -539,6 +564,19 @@ async fn spa_index(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+async fn spa_not_found(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
+    if request.uri().path().starts_with("/api/") {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "That API route does not exist." })),
+        )
+            .into_response();
+    }
+    let mut response = spa_index(State(state)).await;
+    *response.status_mut() = StatusCode::NOT_FOUND;
+    response
+}
+
 /// Azure Files may retain SQLite's migration lock briefly as a container
 /// revision starts. Retry the idempotent migration before declaring startup
 /// unhealthy rather than turning that transient storage condition into a
@@ -576,7 +614,7 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
         "permissions-policy",
         HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
     );
-    headers.insert("content-security-policy", HeaderValue::from_static("default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' https://api.sociobot.in; base-uri 'self'; form-action 'self' https://api.sociobot.in; frame-ancestors 'none'"));
+    headers.insert("content-security-policy", HeaderValue::from_static("default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' https://api.sociobot.in https://sociobotcustomers.ciamlogin.com https://login.microsoftonline.com; frame-src https://sociobotcustomers.ciamlogin.com; object-src 'none'; base-uri 'self'; form-action 'self' https://api.sociobot.in https://sociobotcustomers.ciamlogin.com; frame-ancestors 'none'"));
     headers.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static(if asset {
@@ -592,82 +630,16 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({ "status": "ok", "build": state.build_sha }))
 }
 
-async fn setup(
-    State(state): State<Arc<AppState>>,
-    Json(input): Json<SetupInput>,
-) -> Result<Response, AppError> {
-    if state.production {
-        return Err(AppError::Unauthorized);
-    }
-    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspaces")
-        .fetch_one(&state.db)
-        .await?;
-    if exists > 0 {
-        return Err(AppError::Validation(
-            "This vault is already configured. Sign in instead.".into(),
-        ));
-    }
-    validate_setup(&input)?;
-    let passphrase_hash = hash_passphrase(&input.passphrase)?;
-    let now = Utc::now().to_rfc3339();
-    let mut tx = state.db.begin().await?;
-    sqlx::query("INSERT INTO workspaces (id, business_name, passphrase_hash, timezone, region, deletion_days, created_at) VALUES (1, ?, ?, ?, ?, ?, ?)")
-        .bind(input.business_name.trim()).bind(passphrase_hash).bind(input.timezone.trim()).bind(input.region.trim()).bind(input.deletion_days).bind(now)
-        .execute(&mut *tx).await?;
-    seed_fields(&mut tx).await?;
-    tx.commit().await?;
-    create_session_response(&state).await
-}
-
-async fn login(
-    State(state): State<Arc<AppState>>,
-    Json(input): Json<LoginInput>,
-) -> Result<Response, AppError> {
-    let stored: Option<String> =
-        sqlx::query_scalar("SELECT passphrase_hash FROM workspaces WHERE id = 1")
-            .fetch_optional(&state.db)
-            .await?;
-    let stored =
-        stored.ok_or_else(|| AppError::Validation("Set up the vault before signing in.".into()))?;
-    let parsed = PasswordHash::new(&stored).map_err(|_| AppError::Internal)?;
-    if Argon2::default()
-        .verify_password(input.passphrase.as_bytes(), &parsed)
-        .is_err()
-    {
-        return Err(AppError::Unauthorized);
-    }
-    create_session_response(&state).await
-}
-
-async fn logout(State(state): State<Arc<AppState>>, jar: CookieJar) -> Result<Response, AppError> {
-    if let Some(cookie) = jar.get(SESSION_COOKIE) {
-        sqlx::query("DELETE FROM sessions WHERE token_hash = ?")
-            .bind(token_hash(cookie.value()))
-            .execute(&state.db)
-            .await?;
-    }
-    let value = format!(
-        "{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
-        if state.production { "; Secure" } else { "" }
-    );
-    let mut response = Json(json!({ "ok": true })).into_response();
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&value).map_err(|_| AppError::Internal)?,
-    );
-    Ok(response)
-}
-
 async fn session(
     State(state): State<Arc<AppState>>,
-    jar: CookieJar,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     purge_expired(&state.db).await?;
     let configured: bool = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workspaces")
         .fetch_one(&state.db)
         .await?
         > 0;
-    let authenticated = require_admin(&state, &jar).await.is_ok();
+    let authenticated = require_admin(&state, &headers).await.is_ok();
     let workspace: Option<Workspace> = if authenticated {
         sqlx::query_as(
             "SELECT business_name, timezone, region, deletion_days FROM workspaces WHERE id = 1",
@@ -678,26 +650,25 @@ async fn session(
         None
     };
     Ok(Json(
-        json!({ "configured": configured, "authenticated": authenticated, "setup_allowed": !state.production, "workspace": workspace }),
+        json!({ "configured": configured, "authenticated": authenticated, "identity_provider": "Sociobot Microsoft Entra External ID", "workspace": workspace }),
     ))
 }
 
 async fn admin_form(
     State(state): State<Arc<AppState>>,
-    jar: CookieJar,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
-    require_admin(&state, &jar).await?;
+    require_admin(&state, &headers).await?;
     let fields = load_fields(&state.db).await?;
     Ok(Json(json!({ "fields": serialize_admin_fields(fields) })))
 }
 
 async fn update_form(
     State(state): State<Arc<AppState>>,
-    jar: CookieJar,
     headers: HeaderMap,
     Json(input): Json<FormInput>,
 ) -> Result<Json<Value>, AppError> {
-    require_admin(&state, &jar).await?;
+    require_admin(&state, &headers).await?;
     if !(2..=12).contains(&input.fields.len()) {
         return Err(AppError::Validation(
             "Keep the form between 2 and 12 fields.".into(),
@@ -828,9 +799,9 @@ async fn create_booking(
 
 async fn list_bookings(
     State(state): State<Arc<AppState>>,
-    jar: CookieJar,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
-    require_admin(&state, &jar).await?;
+    require_admin(&state, &headers).await?;
     purge_expired(&state.db).await?;
     let rows: Vec<BookingRow> = sqlx::query_as("SELECT id, created_at, delete_at, status, worker_name FROM bookings ORDER BY created_at DESC").fetch_all(&state.db).await?;
     let mut results = Vec::new();
@@ -848,30 +819,29 @@ async fn list_bookings(
 
 async fn get_booking(
     State(state): State<Arc<AppState>>,
-    jar: CookieJar,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<BookingDetail>, AppError> {
-    require_admin(&state, &jar).await?;
+    require_admin(&state, &headers).await?;
     Ok(Json(load_booking(&state.db, &id, false).await?))
 }
 
 async fn worker_preview(
     State(state): State<Arc<AppState>>,
-    jar: CookieJar,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<BookingDetail>, AppError> {
-    require_admin(&state, &jar).await?;
+    require_admin(&state, &headers).await?;
     Ok(Json(load_booking(&state.db, &id, true).await?))
 }
 
 async fn assign_worker(
     State(state): State<Arc<AppState>>,
-    jar: CookieJar,
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(input): Json<AssignmentInput>,
 ) -> Result<Json<Value>, AppError> {
-    require_admin(&state, &jar).await?;
+    require_admin(&state, &headers).await?;
     let name = input.worker_name.trim();
     if name.len() < 2 || name.len() > 60 {
         return Err(AppError::Validation(
@@ -939,11 +909,11 @@ async fn worker_brief(
 
 async fn update_status(
     State(state): State<Arc<AppState>>,
-    jar: CookieJar,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(input): Json<StatusInput>,
 ) -> Result<Json<Value>, AppError> {
-    require_admin(&state, &jar).await?;
+    require_admin(&state, &headers).await?;
     if !["new", "assigned", "complete"].contains(&input.status.as_str()) {
         return Err(AppError::Validation("Choose a valid job status.".into()));
     }
@@ -960,10 +930,10 @@ async fn update_status(
 
 async fn delete_booking(
     State(state): State<Arc<AppState>>,
-    jar: CookieJar,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    require_admin(&state, &jar).await?;
+    require_admin(&state, &headers).await?;
     let result = sqlx::query("DELETE FROM bookings WHERE id = ?")
         .bind(id)
         .execute(&state.db)
@@ -976,9 +946,9 @@ async fn delete_booking(
 
 async fn export_bookings(
     State(state): State<Arc<AppState>>,
-    jar: CookieJar,
+    headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    require_admin(&state, &jar).await?;
+    require_admin(&state, &headers).await?;
     purge_expired(&state.db).await?;
     let rows: Vec<(String, String, String, String, String, String)> = sqlx::query_as("SELECT b.created_at, b.delete_at, b.status, COALESCE(b.worker_name, ''), r.label_snapshot, r.value FROM bookings b JOIN responses r ON r.booking_id = b.id ORDER BY b.created_at DESC, r.sort_order").fetch_all(&state.db).await?;
     let mut writer = csv::Writer::from_writer(Vec::new());
@@ -994,7 +964,14 @@ async fn export_bookings(
         .map_err(|_| AppError::Internal)?;
     for row in rows {
         writer
-            .write_record([row.0, row.1, row.2, row.3, row.4, row.5])
+            .write_record([
+                csv_safe_cell(&row.0),
+                csv_safe_cell(&row.1),
+                csv_safe_cell(&row.2),
+                csv_safe_cell(&row.3),
+                csv_safe_cell(&row.4),
+                csv_safe_cell(&row.5),
+            ])
             .map_err(|_| AppError::Internal)?;
     }
     let bytes = writer.into_inner().map_err(|_| AppError::Internal)?;
@@ -1004,6 +981,165 @@ async fn export_bookings(
             (
                 header::CONTENT_DISPOSITION,
                 "attachment; filename=private-intake-export.csv",
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+fn sample_demo_workspace() -> DemoWorkspace {
+    let created = Utc::now();
+    let responses = vec![
+        ResponseRow {
+            field_id: "client_name".into(),
+            label_snapshot: "Client name".into(),
+            visibility_snapshot: "admin".into(),
+            value: "Nadia Patel".into(),
+            sort_order: 0,
+        },
+        ResponseRow {
+            field_id: "contact_number".into(),
+            label_snapshot: "Contact number".into(),
+            visibility_snapshot: "admin".into(),
+            value: "+1 555 0142".into(),
+            sort_order: 1,
+        },
+        ResponseRow {
+            field_id: "service_address".into(),
+            label_snapshot: "Service address".into(),
+            visibility_snapshot: "worker".into(),
+            value: "18 Juniper Lane, side entrance".into(),
+            sort_order: 2,
+        },
+        ResponseRow {
+            field_id: "appointment_date".into(),
+            label_snapshot: "Preferred date".into(),
+            visibility_snapshot: "worker".into(),
+            value: "2026-09-04".into(),
+            sort_order: 3,
+        },
+        ResponseRow {
+            field_id: "arrival_window".into(),
+            label_snapshot: "Preferred arrival window".into(),
+            visibility_snapshot: "worker".into(),
+            value: "Morning · 8–12".into(),
+            sort_order: 4,
+        },
+        ResponseRow {
+            field_id: "job_details".into(),
+            label_snapshot: "What needs attention?".into(),
+            visibility_snapshot: "worker".into(),
+            value: "Replace the leaking garden tap.".into(),
+            sort_order: 5,
+        },
+        ResponseRow {
+            field_id: "access_notes".into(),
+            label_snapshot: "Access or safety notes".into(),
+            visibility_snapshot: "worker".into(),
+            value: "Call from the gate. Dog stays indoors.".into(),
+            sort_order: 6,
+        },
+        ResponseRow {
+            field_id: "billing_context".into(),
+            label_snapshot: "Billing or account notes".into(),
+            visibility_snapshot: "admin".into(),
+            value: "Warranty account NW-204. Do not charge on site.".into(),
+            sort_order: 7,
+        },
+    ];
+    DemoWorkspace {
+        id: random_token(32),
+        created_at: created.to_rfc3339(),
+        expires_at: (created + Duration::hours(24)).to_rfc3339(),
+        delete_at: (created + Duration::days(14)).to_rfc3339(),
+        worker_name: "Morgan Lee".into(),
+        status: "assigned".into(),
+        worker_responses: responses
+            .iter()
+            .filter(|response| response.visibility_snapshot == "worker")
+            .cloned()
+            .collect(),
+        manager_responses: responses,
+    }
+}
+
+async fn prune_demo_workspaces(state: &AppState) {
+    let now = Utc::now();
+    state.demos.lock().await.retain(|_, workspace| {
+        chrono::DateTime::parse_from_rfc3339(&workspace.expires_at)
+            .map(|expires| expires > now)
+            .unwrap_or(false)
+    });
+}
+
+async fn create_demo_workspace(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<DemoWorkspace>) {
+    prune_demo_workspaces(&state).await;
+    let workspace = sample_demo_workspace();
+    state
+        .demos
+        .lock()
+        .await
+        .insert(workspace.id.clone(), workspace.clone());
+    (StatusCode::CREATED, Json(workspace))
+}
+
+async fn get_demo_workspace(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<DemoWorkspace>, AppError> {
+    prune_demo_workspaces(&state).await;
+    state
+        .demos
+        .lock()
+        .await
+        .get(&id)
+        .cloned()
+        .map(Json)
+        .ok_or(AppError::NotFound)
+}
+
+async fn reset_demo_workspace(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<DemoWorkspace>, AppError> {
+    prune_demo_workspaces(&state).await;
+    let mut demos = state.demos.lock().await;
+    if demos.remove(&id).is_none() {
+        return Err(AppError::NotFound);
+    }
+    let workspace = sample_demo_workspace();
+    demos.insert(workspace.id.clone(), workspace.clone());
+    Ok(Json(workspace))
+}
+
+async fn export_demo_workspace(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    let workspace = get_demo_workspace(State(state), Path(id)).await?.0;
+    let mut writer = csv::Writer::from_writer(Vec::new());
+    writer
+        .write_record(["field", "visibility", "value"])
+        .map_err(|_| AppError::Internal)?;
+    for response in workspace.manager_responses {
+        writer
+            .write_record([
+                csv_safe_cell(&response.label_snapshot),
+                csv_safe_cell(&response.visibility_snapshot),
+                csv_safe_cell(&response.value),
+            ])
+            .map_err(|_| AppError::Internal)?;
+    }
+    let bytes = writer.into_inner().map_err(|_| AppError::Internal)?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=private-intake-demo.csv",
             ),
         ],
         bytes,
@@ -1039,43 +1175,54 @@ async fn load_booking(
     })
 }
 
-async fn require_admin(state: &AppState, jar: &CookieJar) -> Result<(), AppError> {
-    let token = jar
-        .get(SESSION_COOKIE)
-        .ok_or(AppError::Unauthorized)?
-        .value();
-    let valid: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE token_hash = ? AND expires_at > ?")
-            .bind(token_hash(token))
-            .bind(Utc::now().to_rfc3339())
-            .fetch_one(&state.db)
+async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
+    let oid = state
+        .entra
+        .owner_oid(headers)
+        .await
+        .map_err(|_| AppError::Unauthorized)?;
+    let owner: Option<String> = sqlx::query_scalar("SELECT owner_oid FROM workspaces WHERE id = 1")
+        .fetch_optional(&state.db)
+        .await?
+        .flatten();
+    match owner {
+        Some(owner) if owner == oid => Ok(()),
+        Some(_) => Err(AppError::Forbidden),
+        None => {
+            let result = sqlx::query(
+                "UPDATE workspaces SET owner_oid = ? WHERE id = 1 AND owner_oid IS NULL",
+            )
+            .bind(&oid)
+            .execute(&state.db)
             .await?;
-    if valid == 1 {
-        Ok(())
-    } else {
-        Err(AppError::Unauthorized)
+            if result.rows_affected() == 1 {
+                info!("vault ownership assigned to an authenticated Sociobot Entra identity");
+                return Ok(());
+            }
+            let claimed: Option<String> =
+                sqlx::query_scalar("SELECT owner_oid FROM workspaces WHERE id = 1")
+                    .fetch_optional(&state.db)
+                    .await?
+                    .flatten();
+            if claimed.as_deref() == Some(&oid) {
+                Ok(())
+            } else {
+                Err(AppError::Forbidden)
+            }
+        }
     }
 }
 
-async fn create_session_response(state: &AppState) -> Result<Response, AppError> {
-    let token = random_token(48);
-    let expires = Utc::now() + Duration::days(SESSION_DAYS);
-    sqlx::query("INSERT INTO sessions (token_hash, expires_at) VALUES (?, ?)")
-        .bind(token_hash(&token))
-        .bind(expires.to_rfc3339())
-        .execute(&state.db)
-        .await?;
-    let cookie = format!(
-        "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
-        SESSION_DAYS * 86400,
-        if state.production { "; Secure" } else { "" }
-    );
-    let mut response = Json(json!({ "authenticated": true })).into_response();
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&cookie).map_err(|_| AppError::Internal)?,
-    );
-    Ok(response)
+fn csv_safe_cell(value: &str) -> String {
+    if value
+        .chars()
+        .next()
+        .is_some_and(|first| matches!(first, '=' | '+' | '-' | '@' | '\t' | '\r'))
+    {
+        format!("'{value}")
+    } else {
+        value.to_owned()
+    }
 }
 
 async fn seed_fields(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<(), AppError> {
@@ -1184,40 +1331,6 @@ fn validate_field(field: &FieldInput) -> Result<(), AppError> {
     Ok(())
 }
 
-fn validate_setup(input: &SetupInput) -> Result<(), AppError> {
-    if input.business_name.trim().len() < 2 || input.business_name.trim().len() > 80 {
-        return Err(AppError::Validation(
-            "Business name must be 2–80 characters.".into(),
-        ));
-    }
-    if input.passphrase.len() < 12 {
-        return Err(AppError::Validation(
-            "Use a passphrase with at least 12 characters.".into(),
-        ));
-    }
-    if input.timezone.trim().is_empty() || input.timezone.len() > 64 {
-        return Err(AppError::Validation("Enter a valid timezone.".into()));
-    }
-    if ![
-        "United States",
-        "United Kingdom",
-        "European Union",
-        "Canada",
-        "Australia",
-        "Other",
-    ]
-    .contains(&input.region.as_str())
-    {
-        return Err(AppError::Validation("Choose a privacy region.".into()));
-    }
-    if !(1..=90).contains(&input.deletion_days) {
-        return Err(AppError::Validation(
-            "Choose automatic deletion between 1 and 90 days.".into(),
-        ));
-    }
-    Ok(())
-}
-
 fn validate_value(field: &FormField, value: &str) -> Result<(), AppError> {
     if field.required && value.is_empty() {
         return Err(AppError::Validation(format!(
@@ -1288,16 +1401,12 @@ fn validate_value(field: &FormField, value: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-async fn initialize_workspace_from_env(db: &SqlitePool) -> Result<(), AppError> {
-    let Some(passphrase) = env::var("INITIAL_ADMIN_PASSPHRASE").ok() else {
-        return Ok(());
-    };
+async fn initialize_default_workspace(db: &SqlitePool) -> Result<(), AppError> {
     initialize_workspace_from_bootstrap(
         db,
         BootstrapConfig {
             business_name: env::var("INITIAL_BUSINESS_NAME")
-                .unwrap_or_else(|_| "Private Intake Demo".into()),
-            passphrase,
+                .unwrap_or_else(|_| "Private Intake Field Team".into()),
             timezone: env::var("INITIAL_TIMEZONE").unwrap_or_else(|_| "UTC".into()),
             region: env::var("INITIAL_REGION").unwrap_or_else(|_| "United States".into()),
             deletion_days: env::var("INITIAL_DELETION_DAYS")
@@ -1319,66 +1428,30 @@ async fn initialize_workspace_from_bootstrap(
     if exists > 0 {
         return Ok(());
     }
-    let input = SetupInput {
-        business_name: config.business_name,
-        passphrase: config.passphrase,
-        timezone: config.timezone,
-        region: config.region,
-        deletion_days: config.deletion_days,
-    };
-    validate_setup(&input)?;
+    if config.business_name.trim().len() < 2
+        || config.business_name.trim().len() > 80
+        || config.timezone.trim().is_empty()
+        || config.timezone.len() > 64
+        || !(1..=90).contains(&config.deletion_days)
+    {
+        return Err(AppError::Validation(
+            "The initial workspace settings are invalid.".into(),
+        ));
+    }
     let mut tx = db.begin().await?;
-    let result = sqlx::query("INSERT OR IGNORE INTO workspaces (id, business_name, passphrase_hash, timezone, region, deletion_days, created_at) VALUES (1, ?, ?, ?, ?, ?, ?)")
-        .bind(input.business_name.trim())
-        .bind(hash_passphrase(&input.passphrase)?)
-        .bind(input.timezone.trim())
-        .bind(input.region)
-        .bind(input.deletion_days)
+    let result = sqlx::query("INSERT OR IGNORE INTO workspaces (id, business_name, timezone, region, deletion_days, created_at) VALUES (1, ?, ?, ?, ?, ?)")
+        .bind(config.business_name.trim())
+        .bind(config.timezone.trim())
+        .bind(config.region)
+        .bind(config.deletion_days)
         .bind(Utc::now().to_rfc3339())
         .execute(&mut *tx)
         .await?;
     if result.rows_affected() == 1 {
         seed_fields(&mut tx).await?;
-        info!("workspace initialized from supplied bootstrap configuration");
+        info!("workspace initialized with safe defaults; awaiting Sociobot Entra owner");
     }
     tx.commit().await?;
-    Ok(())
-}
-
-/// Keep the deployment owner credential recoverable without putting it in the
-/// image or repository. Supplying this optional platform secret updates an
-/// existing vault as well as a freshly bootstrapped one and revokes old
-/// sessions whenever the credential changes.
-async fn apply_manager_passphrase(db: &SqlitePool, passphrase: &str) -> Result<(), AppError> {
-    if passphrase.len() < 12 {
-        return Err(AppError::Validation(
-            "The manager passphrase must contain at least 12 characters.".into(),
-        ));
-    }
-    let stored: Option<String> =
-        sqlx::query_scalar("SELECT passphrase_hash FROM workspaces WHERE id = 1")
-            .fetch_optional(db)
-            .await?;
-    let Some(stored) = stored else {
-        return Ok(());
-    };
-    if PasswordHash::new(&stored).ok().is_some_and(|hash| {
-        Argon2::default()
-            .verify_password(passphrase.as_bytes(), &hash)
-            .is_ok()
-    }) {
-        return Ok(());
-    }
-    let mut tx = db.begin().await?;
-    sqlx::query("UPDATE workspaces SET passphrase_hash = ? WHERE id = 1")
-        .bind(hash_passphrase(passphrase)?)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM sessions")
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    info!("manager credential synchronized from supplied configuration");
     Ok(())
 }
 
@@ -1436,14 +1509,6 @@ async fn require_route_pass(state: &AppState, headers: &HeaderMap) -> Result<(),
     }
 }
 
-fn hash_passphrase(passphrase: &str) -> Result<String, AppError> {
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(passphrase.as_bytes(), &salt)
-        .map(|hash| hash.to_string())
-        .map_err(|_| AppError::Internal)
-}
-
 fn token_hash(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
@@ -1494,10 +1559,6 @@ async fn enforce_rate(
 
 async fn purge_expired(db: &SqlitePool) -> Result<(), AppError> {
     let now = Utc::now().to_rfc3339();
-    sqlx::query("DELETE FROM sessions WHERE expires_at <= ?")
-        .bind(&now)
-        .execute(db)
-        .await?;
     sqlx::query("DELETE FROM worker_tokens WHERE expires_at <= ?")
         .bind(&now)
         .execute(db)
@@ -1538,17 +1599,19 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
+        let http = reqwest::Client::new();
         Arc::new(AppState {
             db,
             database_file: None,
             backup_file: None,
-            production: false,
             build_sha: "test-build".into(),
             static_dir,
             rate_windows: Mutex::new(HashMap::new()),
             license_cache: Mutex::new(HashMap::new()),
             billing_base: "http://127.0.0.1:1".into(),
-            http: reqwest::Client::new(),
+            entra: auth::EntraValidator::from_environment(http.clone()),
+            http,
+            demos: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1587,6 +1650,7 @@ mod tests {
     }
 
     #[test]
+    // @claim:token-hashing
     fn tokens_are_never_stored_verbatim() {
         let token = random_token(42);
         assert_ne!(token, token_hash(&token));
@@ -1599,23 +1663,12 @@ mod tests {
         assert!(!valid_id("../../token"));
     }
 
-    #[tokio::test]
-    async fn production_setup_cannot_be_claimed_publicly() {
-        let mut state = test_state(PathBuf::new()).await;
-        sqlx::migrate!().run(&state.db).await.unwrap();
-        Arc::get_mut(&mut state).unwrap().production = true;
-        let result = setup(
-            State(state),
-            Json(SetupInput {
-                business_name: "Attacker workspace".into(),
-                passphrase: "attacker passphrase".into(),
-                timezone: "UTC".into(),
-                region: "United States".into(),
-                deletion_days: 30,
-            }),
-        )
-        .await;
-        assert!(matches!(result, Err(AppError::Unauthorized)));
+    #[test]
+    fn csv_cells_neutralize_every_spreadsheet_formula_prefix() {
+        for value in ["=SUM(1,1)", "+cmd", "-2+3", "@SUM(A1:A2)", "\t=1", "\r=1"] {
+            assert_eq!(csv_safe_cell(value), format!("'{value}"));
+        }
+        assert_eq!(csv_safe_cell("ordinary text"), "ordinary text");
     }
 
     #[tokio::test]
@@ -1626,7 +1679,6 @@ mod tests {
             &state.db,
             BootstrapConfig {
                 business_name: "Durable Route Repairs".into(),
-                passphrase: "a bootstrap passphrase that is long enough".into(),
                 timezone: "UTC".into(),
                 region: "European Union".into(),
                 deletion_days: 30,
@@ -1647,7 +1699,6 @@ mod tests {
             &state.db,
             BootstrapConfig {
                 business_name: "Must not replace owner data".into(),
-                passphrase: "another valid bootstrap passphrase".into(),
                 timezone: "UTC".into(),
                 region: "United States".into(),
                 deletion_days: 1,
@@ -1664,14 +1715,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn controlled_bootstrap_makes_the_production_booking_form_available() {
-        let mut state = test_state(PathBuf::new()).await;
+    async fn zero_secret_bootstrap_makes_the_booking_form_available() {
+        let state = test_state(PathBuf::new()).await;
         sqlx::migrate!().run(&state.db).await.unwrap();
         initialize_workspace_from_bootstrap(
             &state.db,
             BootstrapConfig {
                 business_name: "Configured Field Team".into(),
-                passphrase: "a bootstrap passphrase that is long enough".into(),
                 timezone: "UTC".into(),
                 region: "European Union".into(),
                 deletion_days: 14,
@@ -1679,7 +1729,6 @@ mod tests {
         )
         .await
         .unwrap();
-        Arc::get_mut(&mut state).unwrap().production = true;
         let service = app(state);
 
         let session_response = service
@@ -1701,7 +1750,11 @@ mod tests {
             .to_bytes();
         let session_json: Value = serde_json::from_slice(&session_body).unwrap();
         assert_eq!(session_json["configured"], true);
-        assert_eq!(session_json["setup_allowed"], false);
+        assert_eq!(session_json["authenticated"], false);
+        assert_eq!(
+            session_json["identity_provider"],
+            "Sociobot Microsoft Entra External ID"
+        );
 
         let form_response = service
             .oneshot(
@@ -1725,14 +1778,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supplied_manager_credential_rotates_the_hash_and_revokes_sessions() {
+    async fn first_entra_identity_claims_the_vault_and_other_identities_are_denied() {
         let state = test_state(PathBuf::new()).await;
         sqlx::migrate!().run(&state.db).await.unwrap();
         initialize_workspace_from_bootstrap(
             &state.db,
             BootstrapConfig {
-                business_name: "Credential Test Team".into(),
-                passphrase: "original manager passphrase".into(),
+                business_name: "Identity Test Team".into(),
                 timezone: "UTC".into(),
                 region: "United States".into(),
                 deletion_days: 30,
@@ -1740,32 +1792,21 @@ mod tests {
         )
         .await
         .unwrap();
-        sqlx::query("INSERT INTO sessions (token_hash, expires_at) VALUES ('old', ?)")
-            .bind((Utc::now() + Duration::days(1)).to_rfc3339())
-            .execute(&state.db)
-            .await
-            .unwrap();
-
-        apply_manager_passphrase(&state.db, "replacement manager passphrase")
-            .await
-            .unwrap();
-        let stored: String =
-            sqlx::query_scalar("SELECT passphrase_hash FROM workspaces WHERE id = 1")
-                .fetch_one(&state.db)
-                .await
-                .unwrap();
-        let parsed = PasswordHash::new(&stored).unwrap();
-        assert!(Argon2::default()
-            .verify_password(b"replacement manager passphrase", &parsed)
-            .is_ok());
-        assert!(Argon2::default()
-            .verify_password(b"original manager passphrase", &parsed)
-            .is_err());
-        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+        let mut owner_headers = HeaderMap::new();
+        owner_headers.insert("x-test-oid", HeaderValue::from_static("entra-owner-one"));
+        require_admin(&state, &owner_headers).await.unwrap();
+        let stored: String = sqlx::query_scalar("SELECT owner_oid FROM workspaces WHERE id = 1")
             .fetch_one(&state.db)
             .await
             .unwrap();
-        assert_eq!(sessions, 0);
+        assert_eq!(stored, "entra-owner-one");
+
+        let mut other_headers = HeaderMap::new();
+        other_headers.insert("x-test-oid", HeaderValue::from_static("entra-owner-two"));
+        assert!(matches!(
+            require_admin(&state, &other_headers).await,
+            Err(AppError::Forbidden)
+        ));
     }
 
     #[tokio::test]
@@ -1781,10 +1822,11 @@ mod tests {
             .fetch_one(&db)
             .await
             .unwrap();
-        assert_eq!(migration_count, 1);
+        assert_eq!(migration_count, 2);
     }
 
     #[tokio::test]
+    // @claim:durable-snapshot
     async fn durable_snapshot_restores_the_last_local_vault_copy() {
         let directory = env::temp_dir().join(format!("piv-snapshot-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -1825,7 +1867,7 @@ mod tests {
     #[test]
     fn client_identity_uses_the_first_forwarded_hop() {
         let mut request = Request::builder()
-            .uri("/api/login")
+            .uri("/api/session")
             .header("x-forwarded-for", "203.0.113.9, 10.0.0.4")
             .body(Body::empty())
             .unwrap();
@@ -1839,7 +1881,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_rate_limit_is_forwarded_ip_aware_and_returns_retry_after() {
+    async fn identity_rate_limit_is_forwarded_ip_aware_and_returns_retry_after() {
         let state = test_state(PathBuf::new()).await;
         sqlx::migrate!().run(&state.db).await.unwrap();
         let service = app(state);
@@ -1849,19 +1891,17 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .method("POST")
-                        .uri("/api/login")
-                        .header(header::CONTENT_TYPE, "application/json")
+                        .uri("/api/session")
                         .header("x-forwarded-for", "203.0.113.20, 10.0.0.4")
-                        .body(Body::from(r#"{"passphrase":"invalid passphrase"}"#))
+                        .body(Body::empty())
                         .unwrap(),
                 )
                 .await
                 .unwrap();
             assert_eq!(
                 response.status(),
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "attempt {attempt} should reach the login handler"
+                StatusCode::OK,
+                "attempt {attempt} should reach the identity handler"
             );
         }
 
@@ -1869,11 +1909,9 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .method("POST")
-                    .uri("/api/login")
-                    .header(header::CONTENT_TYPE, "application/json")
+                    .uri("/api/session")
                     .header("x-forwarded-for", "203.0.113.20, 10.0.0.4")
-                    .body(Body::from(r#"{"passphrase":"invalid passphrase"}"#))
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
@@ -1884,16 +1922,14 @@ mod tests {
         let separate_client = service
             .oneshot(
                 Request::builder()
-                    .method("POST")
-                    .uri("/api/login")
-                    .header(header::CONTENT_TYPE, "application/json")
+                    .uri("/api/session")
                     .header("x-forwarded-for", "203.0.113.21, 10.0.0.4")
-                    .body(Body::from(r#"{"passphrase":"invalid passphrase"}"#))
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(separate_client.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(separate_client.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1907,7 +1943,7 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri("/api/session")
+                        .uri("/api/form/public")
                         .header("x-forwarded-for", "198.51.100.30")
                         .body(Body::empty())
                         .unwrap(),
@@ -1919,7 +1955,7 @@ mod tests {
         let limited = service
             .oneshot(
                 Request::builder()
-                    .uri("/api/session")
+                    .uri("/api/form/public")
                     .header("x-forwarded-for", "198.51.100.30")
                     .body(Body::empty())
                     .unwrap(),
@@ -1955,6 +1991,43 @@ mod tests {
     }
 
     #[tokio::test]
+    // @claim:automatic-deletion
+    async fn claim_automatic_deletion() {
+        let state = test_state(PathBuf::new()).await;
+        sqlx::migrate!().run(&state.db).await.unwrap();
+        let now = Utc::now();
+        for (id, delete_at) in [
+            ("expired", now - Duration::minutes(1)),
+            ("current", now + Duration::days(1)),
+        ] {
+            sqlx::query("INSERT INTO bookings (id, created_at, delete_at) VALUES (?, ?, ?)")
+                .bind(id)
+                .bind((now - Duration::days(2)).to_rfc3339())
+                .bind(delete_at.to_rfc3339())
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO worker_tokens (token_hash, booking_id, expires_at, created_at) VALUES ('expired-token', 'expired', ?, ?)")
+            .bind((now + Duration::hours(2)).to_rfc3339())
+            .bind(now.to_rfc3339())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        purge_expired(&state.db).await.unwrap();
+        let bookings: Vec<String> = sqlx::query_scalar("SELECT id FROM bookings ORDER BY id")
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+        let tokens: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worker_tokens")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(bookings, vec!["current"]);
+        assert_eq!(tokens, 0);
+    }
+
+    #[tokio::test]
     async fn recognized_spa_routes_return_the_shell_with_ok_status() {
         let static_dir = env::temp_dir().join(format!("piv-spa-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&static_dir).unwrap();
@@ -1963,8 +2036,10 @@ mod tests {
 
         for path in [
             "/",
+            "/demo",
             "/book",
             "/admin",
+            "/auth/callback",
             "/privacy",
             "/terms",
             "/worker/a-live-token",
@@ -1999,5 +2074,35 @@ mod tests {
             .unwrap();
         assert_eq!(missing_asset.status(), StatusCode::NOT_FOUND);
         std::fs::remove_dir_all(static_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_requests_keep_the_security_policy_headers() {
+        let state = test_state(PathBuf::new()).await;
+        sqlx::migrate!().run(&state.db).await.unwrap();
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/bookings")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        "{{\"values\":{{\"oversized\":\"{}\"}},\"website\":\"\"}}",
+                        "x".repeat(70_000)
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(response.headers().contains_key("content-security-policy"));
+        assert_eq!(
+            response.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
     }
 }

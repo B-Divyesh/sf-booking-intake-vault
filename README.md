@@ -1,89 +1,107 @@
 # Private Intake
 
-Private Intake is a small-team booking form that turns one client submission into two deliberately different records: a complete manager record and a minimal, expiring worker brief. Field visibility is enforced by the Rust service, not by hiding values in the browser.
+Private Intake collects one field-service booking and creates two records: a
+complete manager record and a smaller worker brief. The Rust service removes
+manager-only answers before it returns any worker response.
 
-It is for plumbers, cleaners, repair teams and other field-service operators who need the site and job facts to travel, while client contact, property, project or commercial context stays private.
+Try the isolated sample at `/demo` or
+`https://booking-intake-vault.sociobot.in/demo`. It needs no account and does
+not change real bookings.
 
-## What v1 includes
+## What it includes
 
-- First-run single-team vault setup with an Argon2-hashed manager passphrase
-- Hosted, configurable intake form with `Worker sees` and `Manager only` fields
-- Immutable visibility snapshots on every submitted answer
-- Manager arrival board, complete record and server-built redaction preview
-- Expiring, revocable worker links backed by hashed tokens
-- Automatic 1–90 day deletion, immediate confirmed deletion and CSV export
-- Optional US$29 one-time Route pass through the Sociobot billing API
-- Privacy/terms pages, offline feedback, mobile layouts and keyboard focus states
+- A hosted eight-question booking form that is ready on first start
+- Field labels for `Worker sees` and `Manager only`
+- A manager board protected by Sociobot Microsoft Entra External ID
+- Server-built worker briefs with expiring, revocable links
+- A configured deletion date, immediate deletion, and spreadsheet-safe CSV
+- An optional US$29 one-time Route pass for 12 questions and longer links
+- An offline demo reload, mobile layouts, and keyboard focus states
 
-Non-goals are calendar sync, payment collection, dispatch optimization and CRM functionality.
+Calendar sync, payment collection, emergency dispatch, and CRM features are
+outside this version.
 
 ## Architecture
 
-The Svelte 5/Vite client is compiled to `frontend/dist`. Axum serves that client and a same-origin JSON API. SQLite stores the single workspace, form configuration, bookings, response visibility snapshots, hashed manager sessions and hashed worker tokens. No booking or worker token is written to application logs.
+Svelte 5 and Vite build the client into `frontend/dist`. Axum serves that client
+and a same-origin JSON API. SQLite stores the workspace, form, bookings,
+response visibility snapshots, the stable Entra owner ID, and hashed worker
+tokens. Demo workspaces stay in a separate in-memory map for 24 hours and use
+only `demo:private-intake:` keys in browser session storage.
 
-### Identity boundary
-
-Private Intake is a single-team vault installation, not a shared Sociobot user account. It has one deployment-local manager passphrase and does not provide user registration, multi-team tenancy, or cross-product identity. Workers use narrow, expiring bearer links and never receive manager access. Because no Sociobot identity is required, the Sociobot Entra tenant is deliberately outside this v1 authentication boundary. A future multi-manager or multi-tenant version must replace the local manager credential with Sociobot Entra; it must not add another password system.
+The browser signs managers in through the Sociobot Entra External ID authority.
+The server validates the issuer, RS256 signature, JWKS key, audience, tenant,
+and stable `oid` claim before every manager operation. The first valid identity
+claims an unowned vault; later identities receive 403.
 
 ## Run locally
 
-Requirements: Node 22+, npm, Rust 1.88+, and Chromium for the Playwright version pinned in `package.json`.
+Requirements: Node 22+, npm, Rust stable, and Chromium for Playwright 1.58.2.
 
 ```sh
 npm ci
 npm run build:web
-DATABASE_URL='sqlite://private-intake.db?mode=rwc' cargo run
+PORT=8080 cargo run
 ```
 
-Open `http://localhost:8080`. In local development, the first manager to open `/admin` configures the vault. Production disables public setup and must be initialized with the deployment-only bootstrap variables below. Use a persistent database file in production; losing that file loses the vault.
-
-For frontend hot reload, run the API as above and run `npm run dev` separately. Vite proxies API calls to port 8080.
+Open `http://localhost:8080`. The public form and demo work immediately. The
+manager redirect URI must be registered with Sociobot Entra to sign in outside
+the automated test environment.
 
 ## Test and build
 
 ```sh
+npm run check
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
 npm test
 npm run build
+npm audit --audit-level=high
 ```
 
-`npm test` runs Vitest utility tests, Rust authorization/data tests, and Playwright end-to-end tests including axe serious/critical checks and the 390 px booking layout. The reproducible production build command is exactly `npm run build`; web artifacts land in `frontend/dist` and the Rust binary in `target/release/booking-intake-vault`.
+`npm test` runs Vitest, Rust integration tests, and Playwright browser tests.
+The claim commands are listed in [`.factory/claims.json`](.factory/claims.json).
+The production build creates `frontend/dist` and
+`target/release/booking-intake-vault`.
 
-If Playwright browsers are not already present:
+## Runtime configuration
 
-```sh
-npx playwright install chromium
-```
-
-## Container
-
-```sh
-docker build -t private-intake .
-docker run --rm -p 8080:8080 -v private-intake-data:/data private-intake
-```
-
-Runtime configuration is environment-only:
+The container starts with only `PORT` and creates a usable default workspace.
+All other settings are optional overrides:
 
 - `PORT` — listener port, default `8080`
-- `DATABASE_URL` — SQLite URL, default in the image is `sqlite:///data/private-intake.db?mode=rwc`
-- `APP_ENV=production` — enables `Secure` on manager session cookies
-- `BUILD_SHA` — returned by `/health` for deployment identification
-- `RUST_LOG` — structured JSON log filter, default `info`
-- `INITIAL_ADMIN_PASSPHRASE` — optional production bootstrap secret; when the database is empty, creates the owner workspace without exposing a public claim endpoint
-- `MANAGER_PASSPHRASE` — optional platform secret that initializes or rotates the single-vault manager credential; use it to keep owner access recoverable across revisions
-- `INITIAL_BUSINESS_NAME`, `INITIAL_TIMEZONE`, `INITIAL_REGION`, `INITIAL_DELETION_DAYS` — optional bootstrap metadata with safe defaults
-- `BILLING_BASE` — optional Sociobot API override for integration testing
+- `DATABASE_URL` — SQLite URL, default `sqlite://private-intake.db?mode=rwc`
+- `DATABASE_BACKUP_PATH` — durable snapshot destination when a volume is mounted
+- `BUILD_SHA` — value returned by `/health`
+- `RUST_LOG` — structured log filter, default `info`
+- `INITIAL_BUSINESS_NAME`, `INITIAL_TIMEZONE`, `INITIAL_REGION`, and
+  `INITIAL_DELETION_DAYS` — first-boot workspace labels and retention
+- `ENTRA_TENANT_ID`, `ENTRA_TENANT_SUBDOMAIN`, and `ENTRA_CLIENT_ID` — optional
+  overrides for the built-in Sociobot External ID settings
+- `BILLING_BASE` — optional Sociobot billing API override for tests
 
-The service starts successfully with only `PORT`. For an Internet-facing deployment, supply `INITIAL_ADMIN_PASSPHRASE` as a platform secret before opening the form. Its value is never logged. Once initialized on persistent storage, the bootstrap secret can be removed.
+Production uses one replica and an Azure Files mount at `/data`; see
+[`.factory/deployment.md`](.factory/deployment.md). The app restores its local
+SQLite copy from that mount at startup and snapshots successful API changes.
 
 ## Privacy and operations
 
-All private filtering happens in SQL on the server. Public form configuration omits visibility metadata. Worker links are bearer secrets: share them only with the assigned worker and issue a new link if one escapes. Paid limits are also enforced by the server using Sociobot license verification; the browser cannot unlock them by itself. Requests are capped at 64 KB and setup, login and public submission endpoints are rate-limited per connection.
+The public form never receives field-visibility metadata. Worker queries select
+only answers marked `worker`, and assignment tokens are stored as hashes.
+Documents and APIs use `no-store`; hashed static assets use immutable caching.
+The app loads no analytics, third-party fonts, or third-party runtime scripts.
+License verification contacts only the Sociobot API after a license is present.
+See `/privacy` and `/terms` in the running application.
 
-The app loads no third-party runtime scripts, fonts or analytics. License verification calls the Sociobot API only when a pass is present. See `/privacy` and `/terms` in the running application.
+Every endpoint is rate limited by the first `X-Forwarded-For` address. The
+general allowance is 120 requests per minute, identity checks allow 20, and
+writes allow 60. A limited response includes `429` and `Retry-After`.
 
 ## Deployment
 
-The factory deploys the root `Dockerfile`; this repository does not manage DNS, billing registration or infrastructure. This stateful product also requires the one-replica Azure Files mount recorded in [`.factory/deployment.md`](.factory/deployment.md); replacing the Container App template with only `PORT` removes the vault. The Sociobot product is registered after handoff, so the code uses only the documented product slug and contains no product ID or provider secret.
+The factory deploys the root `Dockerfile`; this repository does not manage DNS
+or billing registration. The image runs as a non-root user on `PORT`, and
+`/health` returns the supplied build SHA.
 
 ## License
 

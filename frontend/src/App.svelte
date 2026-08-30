@@ -1,9 +1,11 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { BILLING_BASE, PRODUCT_SLUG, LICENSE_KEY, VERDICT_KEY, cachedVerdict, captureLicense, formatDate } from './lib';
+  import { accessToken, finishSignIn, signIn, signOut, testOwnerOid } from './auth';
   import BookingFormInner from './BookingFormInner.svelte';
   import AdminInner from './AdminInner.svelte';
   import WorkerInner from './WorkerInner.svelte';
+  import DemoInner from './DemoInner.svelte';
 
   type Field = { id?: string; label: string; field_type: string; required: boolean; visibility: 'worker' | 'admin'; options: string[] };
   type ResponseItem = { field_id: string; label_snapshot: string; visibility_snapshot: 'worker' | 'admin'; value: string; sort_order: number };
@@ -19,12 +21,46 @@
   let licenseValid = false;
   let licenseReason = '';
   let licenseInput = '';
+  let buildId = 'development';
+  let routeAnnouncement = '';
+  let routeFocusDeadline = 0;
+  let focusedRouteHeading: HTMLElement | null = null;
+
+  function titleFor(currentPath: string) {
+    if (currentPath === '/book') return 'Book a service — Private Intake';
+    if (currentPath === '/demo') return 'Demo — Private Intake';
+    if (currentPath === '/admin' || currentPath === '/auth/callback') return 'Manager vault — Private Intake';
+    if (currentPath === '/privacy') return 'Privacy — Private Intake';
+    if (currentPath === '/terms') return 'Terms — Private Intake';
+    if (currentPath.startsWith('/worker/')) return 'Worker job brief — Private Intake';
+    if (currentPath !== '/') return 'Page not found — Private Intake';
+    return 'Private Intake — Share only needed job details';
+  }
+
+  function focusCurrentHeading() {
+    if (Date.now() > routeFocusDeadline) return;
+    const heading = document.querySelector<HTMLElement>('main h1');
+    if (heading && heading !== focusedRouteHeading) {
+      focusedRouteHeading = heading;
+      heading.tabIndex = -1;
+      heading.focus({ preventScroll: true });
+      routeAnnouncement = heading.textContent?.trim() || titleFor(path);
+    }
+  }
+
+  async function finishRouteChange() {
+    routeFocusDeadline = Date.now() + 5000;
+    focusedRouteHeading = null;
+    await tick();
+    focusCurrentHeading();
+  }
 
   function navigate(next: string) {
     history.pushState({}, '', next);
     path = next;
     error = ''; notice = '';
     window.scrollTo({ top: 0, behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+    void finishRouteChange();
   }
 
   async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
@@ -33,6 +69,12 @@
     if (!navigator.onLine) throw new Error('You’re offline. Reconnect and try again.');
     const headers = new Headers(options.headers);
     headers.set('content-type', 'application/json');
+    const testOid = testOwnerOid();
+    if (testOid) headers.set('x-test-oid', testOid);
+    if (testOid || path === '/admin' || path === '/auth/callback') {
+      const identityToken = await accessToken();
+      if (identityToken) headers.set('authorization', `Bearer ${identityToken}`);
+    }
     const license = licenseValid ? localStorage.getItem(LICENSE_KEY) : null;
     if (license) headers.set('x-route-license', license);
     const response = await fetch(url, { ...options, credentials: 'same-origin', headers });
@@ -78,16 +120,39 @@
     if (captureLicense(url, localStorage)) {
       url.searchParams.delete('license'); history.replaceState({}, '', url.pathname + url.search + url.hash); notice = 'License received. Verifying your Route pass…';
     }
-    addEventListener('popstate', () => { path = location.pathname; });
+    if (path === '/auth/callback') {
+      try {
+        if (await finishSignIn()) {
+          history.replaceState({}, '', '/admin');
+          path = '/admin';
+        }
+      } catch { error = 'Sociobot sign-in could not be completed. Try again.'; }
+    }
+    addEventListener('popstate', () => { path = location.pathname; void finishRouteChange(); });
     addEventListener('online', () => { online = true; });
     addEventListener('offline', () => { online = false; });
-    await Promise.all([loadSession(), verifyLicense()]);
+    const routeObserver = new MutationObserver(() => requestAnimationFrame(focusCurrentHeading));
+    const main = document.querySelector('main');
+    if (main) routeObserver.observe(main, { childList: true, subtree: true });
+    const health = fetch('/health').then((response) => response.json()).then((value) => { buildId = String(value.build || 'development'); }).catch(() => {});
+    const identity = path === '/admin' || path === '/auth/callback' ? loadSession() : Promise.resolve();
+    await Promise.all([identity, verifyLicense(), health]);
     loading = false;
   });
 </script>
 
 <svelte:head>
-  <title>{path === '/book' ? 'Book a service' : path.startsWith('/worker/') ? 'Worker job brief' : path === '/admin' ? 'Manager vault' : path === '/privacy' ? 'Privacy notice' : path === '/terms' ? 'Terms of use' : 'Private Intake — least-privilege booking forms'}</title>
+  <title>{titleFor(path)}</title>
+  <link rel="canonical" href={`https://booking-intake-vault.sociobot.in${path === '/auth/callback' ? '/admin' : path}`} />
+  <meta property="og:title" content={titleFor(path)} />
+  <meta property="og:description" content="Collect client details once and send assigned workers only the job facts they need." />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content={`https://booking-intake-vault.sociobot.in${path === '/auth/callback' ? '/admin' : path}`} />
+  <meta property="og:image" content="https://booking-intake-vault.sociobot.in/assets/private-routes-social.webp" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content={titleFor(path)} />
+  <meta name="twitter:description" content="Collect client details once and send assigned workers only the job facts they need." />
+  <meta name="twitter:image" content="https://booking-intake-vault.sociobot.in/assets/private-routes-social.webp" />
   {#if path === '/'}
     <link rel="preload" as="image" href="/assets/private-routes-1200.webp" imagesrcset="/assets/private-routes-720.webp 720w, /assets/private-routes-1200.webp 1200w" imagesizes="(max-width: 700px) calc(100vw - 28px), min(56vw, 700px)" fetchpriority="high" />
   {/if}
@@ -99,10 +164,13 @@
     <span>Private Intake</span>
   </a>
   <nav aria-label="Primary navigation">
+    <a href="/demo" onclick={(event) => { event.preventDefault(); navigate('/demo'); }}>Demo</a>
     <a href="/book" onclick={(event) => { event.preventDefault(); navigate('/book'); }}>Booking form</a>
     <a href="/admin" class="nav-ticket" onclick={(event) => { event.preventDefault(); navigate('/admin'); }}>Manager vault</a>
   </nav>
 </header>
+
+<div class="route-announcement" aria-live="polite" aria-atomic="true">{routeAnnouncement}</div>
 
 {#if !online}
   <div class="offline" role="status"><span aria-hidden="true">◇</span> You’re offline. Existing details stay visible; reconnect before saving.</div>
@@ -117,10 +185,12 @@
     </section>
   {:else if path === '/'}
     {@render Landing(navigate)}
+  {:else if path === '/demo'}
+    <DemoInner {request} {navigate} />
   {:else if path === '/book'}
     <BookingFormInner {request} {navigate} state={{}} />
-  {:else if path === '/admin'}
-    <AdminInner {request} bind:session {loadSession} {licenseValid} {licenseReason} bind:licenseInput {restoreLicense} />
+  {:else if path === '/admin' || path === '/auth/callback'}
+    <AdminInner {request} bind:session {loadSession} {licenseValid} {licenseReason} bind:licenseInput {restoreLicense} {signIn} {signOut} />
   {:else if path.startsWith('/worker/')}
     <WorkerInner token={path.slice('/worker/'.length)} {request} />
   {:else if path === '/privacy'}
@@ -128,7 +198,7 @@
   {:else if path === '/terms'}
     <Terms />
   {:else}
-    <section class="state-screen"><p class="eyebrow">Route closed</p><h1>That stop isn’t on this line</h1><p>The page may have moved or the worker link may be incomplete.</p><button onclick={() => navigate('/')}>Return home</button></section>
+    <section class="state-screen"><p class="eyebrow">Page not found</p><h1>This page does not exist</h1><p>Check the address or return to the Private Intake home page.</p><button onclick={() => navigate('/')}>Return home</button></section>
   {/if}
 
   {#if error}<div class="toast error" role="alert">{error}</div>{/if}
@@ -136,12 +206,12 @@
 </main>
 
 <footer>
-  <div><span class="footer-mark" aria-hidden="true">PI</span><p><strong>Private Intake</strong><br />The right details. The right hands.</p></div>
+  <div><span class="footer-mark" aria-hidden="true">PI</span><p><strong>Private Intake</strong><br />Share only the job details a worker needs.</p></div>
   <nav aria-label="Legal">
     <a href="/privacy" onclick={(e) => { e.preventDefault(); navigate('/privacy'); }}>Privacy</a>
     <a href="/terms" onclick={(e) => { e.preventDefault(); navigate('/terms'); }}>Terms</a>
   </nav>
-  <p class="disclosure">Hero artwork is original AI-generated imagery, created for this product.</p>
+  <p class="disclosure">Built by Param Factory · Build {buildId.slice(0, 12)}<br />Original AI-generated hero artwork.</p>
 </footer>
 
 {#snippet routeIcon(kind: 'worker' | 'admin')}
@@ -201,7 +271,7 @@
 {#snippet publicPrivacy(region: string, days: number)}
   <aside class="privacy-note">
     <span aria-hidden="true">◆</span>
-    <div><strong>Details travel on separate routes.</strong><p>Your information is retained for {days} days, then deleted. The assigned worker receives only job and access details. Contact and billing context stay with the manager. Regional notice: {region}.</p></div>
+    <div><strong>Your details have two visibility levels.</strong><p>Your information is retained for {days} days, then deleted. The assigned worker receives only job and access details. Contact and billing context stay with the manager. Regional notice: {region}.</p></div>
   </aside>
 {/snippet}
 
@@ -216,14 +286,15 @@
 {#snippet Landing(navigate: (path: string) => void)}
   <section class="hero">
     <div class="hero-copy">
-      {@render headingEyebrow('Least-privilege booking for field teams')}
-      <h1>Client details,<br /><em>routed with care.</em></h1>
-      <p class="lede">Collect the whole story once. Send each worker a clean job brief with only what they need—and keep private context in the manager’s vault.</p>
+      {@render headingEyebrow('Private booking for field-service teams')}
+      <h1>Collect once. <em>Share only job details.</em></h1>
+      <p class="lede">For field-service teams that keep client context private when they assign work.</p>
       <div class="action-row">
-        <a class="button" href="/admin" onclick={(e) => { e.preventDefault(); navigate('/admin'); }}>Set up your vault <span aria-hidden="true">→</span></a>
-        <a class="text-link" href="#how">See the privacy route <span aria-hidden="true">↓</span></a>
+        <a class="button" href="/demo" onclick={(e) => { e.preventDefault(); navigate('/demo'); }}>Try it with sample data <span aria-hidden="true">→</span></a>
+        <span class="action-explainer">See one booking split into manager and worker views.</span>
+        <a class="text-link" href="/book" onclick={(e) => { e.preventDefault(); navigate('/book'); }}>Open the booking form</a>
       </div>
-      <ul class="trust-list" aria-label="Product assurances"><li>Server-enforced roles</li><li>Automatic deletion</li><li>No trackers</li></ul>
+      <ul class="trust-list" aria-label="Product facts"><li>Core booking tools are free</li><li>Works offline after your first visit</li><li>No trackers or third-party scripts</li></ul>
     </div>
     <figure class="hero-poster">
       <picture>
@@ -235,32 +306,37 @@
   </section>
 
   <section class="route-story" id="how">
-    <div class="section-heading">{@render headingEyebrow('One intake · two destinations')}<h2>Privacy is a route,<br />not a promise.</h2></div>
+    <div class="section-heading">{@render headingEyebrow('How it works')}<h2>Send each person only what they need</h2></div>
     <ol class="route-steps">
-      {@render feature('01', 'Collect once', 'A calm hosted form gathers contact, site, schedule and private commercial context.')}
-      {@render feature('02', 'Mark every field', 'Each question is explicitly tagged Worker sees or Manager only before a client submits.')}
-      {@render feature('03', 'Share a clean brief', 'An expiring link contains only worker-safe facts. Private answers never enter that response.')}
+      {@render feature('01', 'Collect the booking', 'The hosted form gathers contact, site, schedule, and private account details.')}
+      {@render feature('02', 'Choose who sees each answer', 'Every question says “Worker sees” or “Manager only” before a client submits.')}
+      {@render feature('03', 'Send an expiring brief', 'The server builds a worker link from permitted job facts only.')}
     </ol>
   </section>
 
   <section class="split-proof">
-    <div><p class="eyebrow coral">◆ Manager vault</p><h2>Client name · phone · billing</h2><p>Full context remains behind your passphrase.</p></div>
-    <div><p class="eyebrow green">◎ Worker ticket</p><h2>Address · arrival · job notes</h2><p>A clear operational brief, without the overshare.</p></div>
+    <div><p class="eyebrow coral">◆ Manager vault</p><h2>Client name · phone · billing</h2><p>Full context stays behind Sociobot sign-in.</p></div>
+    <div><p class="eyebrow green">◎ Worker ticket</p><h2>Address · arrival · job notes</h2><p>A worker brief excludes contact and billing details.</p></div>
+  </section>
+
+  <section class="route-story limits-section">
+    <div class="section-heading">{@render headingEyebrow('Scope and privacy')}<h2>What this service does not do</h2></div>
+    <div><p>Private Intake does not schedule calendars, collect payments, dispatch emergencies, or replace a customer record system.</p><p>Managers choose each field’s visibility. The server filters every worker brief and removes each booking on its deletion date.</p></div>
   </section>
 
   <section class="cta-band">
-    <div><p class="eyebrow">Next departure</p><h2>Open a safer intake route today.</h2></div>
-    <a class="button" href="/admin" onclick={(e) => { e.preventDefault(); navigate('/admin'); }}>Build the form <span aria-hidden="true">→</span></a>
+    <div><p class="eyebrow">Optional Route pass</p><h2>Keep core tools free or add more fields</h2><p>Core booking, export, deletion, and accessibility are free. Pay US$29 once for 12 questions and longer worker links.</p></div>
+    <a class="button" href="/admin" onclick={(e) => { e.preventDefault(); navigate('/admin'); }}>Open manager tools <span aria-hidden="true">→</span></a>
   </section>
 {/snippet}
 
 {#snippet Privacy()}
   <article class="legal-page">
-    {@render headingEyebrow('Privacy notice · effective 28 August 2026')}
-    <h1>Short retention.<br />Narrow access.</h1>
+    {@render headingEyebrow('Privacy notice · effective 30 August 2026')}
+    <h1>How Private Intake handles data</h1>
     <p class="lede">Private Intake is designed to minimize the client information a field worker can access. The team operating a vault is the controller of information submitted through its form; Private Intake processes it to provide the service.</p>
     {@render decoRule()}
-    <h2>What is stored</h2><p>We store answers entered on the booking form, submission and deletion timestamps, job status, assigned worker name, and a hashed access credential. Manager passphrases and worker-link tokens are stored as one-way hashes.</p>
+    <h2>What is stored</h2><p>We store booking answers, submission and deletion times, job status, assigned worker name, the manager’s Entra account ID, and hashed worker-link tokens.</p>
     <h2>Who can see it</h2><p>Managers can view and export all answers. A worker with a live assignment link receives only answers that were marked “Worker sees” when submitted. This filter is enforced by the server.</p>
     <h2>Retention and deletion</h2><p>The manager selects a retention window of 1–90 days. Expired submissions and their worker links are deleted automatically. Managers can export or delete a booking earlier from the vault.</p>
     <h2>Infrastructure and billing</h2><p>No advertising analytics, tracking scripts, third-party fonts, or client identifiers in application logs are used. If you buy a Route pass, Sociobot/Dodo is the merchant of record and processes payment; this app stores only your license token on this device.</p>
@@ -270,8 +346,8 @@
 
 {#snippet Terms()}
   <article class="legal-page">
-    {@render headingEyebrow('Terms of use · effective 28 August 2026')}
-    <h1>A clear route<br />for responsible use.</h1>
+    {@render headingEyebrow('Terms of use · effective 30 August 2026')}
+    <h1>Terms for using Private Intake</h1>
     <p class="lede">Private Intake is a booking-intake and least-privilege job-brief service. It is not a calendar, emergency dispatch system, payment processor or customer record system.</p>
     {@render decoRule()}
     <h2>Your responsibilities</h2><p>You must have a lawful reason to collect submitted information, ask only for what your service needs, configure worker visibility carefully, keep assignment links secure, and respond to data-rights requests.</p>

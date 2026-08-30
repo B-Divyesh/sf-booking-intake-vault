@@ -1,21 +1,21 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { BILLING_BASE, PRODUCT_SLUG, formatDate } from './lib';
+  import { accessToken, testOwnerOid } from './auth';
   type Workspace = { business_name: string; timezone: string; region: string; deletion_days: number };
-  type Session = { configured: boolean; authenticated: boolean; setup_allowed?: boolean; workspace: Workspace | null };
+  type Session = { configured: boolean; authenticated: boolean; identity_provider?: string; workspace: Workspace | null };
   type Field = { id?: string; label: string; field_type: string; required: boolean; visibility: 'worker' | 'admin'; options: string[] };
   type Item = { field_id: string; label_snapshot: string; visibility_snapshot: 'worker' | 'admin'; value: string; sort_order: number };
   type Booking = { id: string; created_at: string; delete_at: string; status: string; worker_name?: string; summary?: string; responses?: Item[] };
   type ApiRequest = <T>(url: string, options?: RequestInit) => Promise<T>;
-  let { request, session = $bindable(), loadSession, licenseValid, licenseReason, licenseInput = $bindable(), restoreLicense } = $props<{
-    request: ApiRequest; session: Session; loadSession: () => Promise<void>; licenseValid: boolean; licenseReason: string; licenseInput: string; restoreLicense: () => void;
+  let { request, session = $bindable(), loadSession, licenseValid, licenseReason, licenseInput = $bindable(), restoreLicense, signIn, signOut } = $props<{
+    request: ApiRequest; session: Session; loadSession: () => Promise<void>; licenseValid: boolean; licenseReason: string; licenseInput: string; restoreLicense: () => void; signIn: () => Promise<void>; signOut: () => Promise<void>;
   }>();
   let mode = $state<'jobs'|'form'|'pass'>('jobs'); let loading = $state(false); let error = $state(''); let notice = $state('');
-  let setup = $state({ business_name: '', passphrase: '', timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC', region: 'United States', deletion_days: 30 });
-  let passphrase = $state(''); let bookings = $state<Booking[]>([]); let selected = $state<Booking | null>(null); let preview = $state<Booking | null>(null); let fields = $state<Field[]>([]);
+  let bookings = $state<Booking[]>([]); let selected = $state<Booking | null>(null); let preview = $state<Booking | null>(null); let fields = $state<Field[]>([]);
   let workerName = $state(''); let linkHours = $state(48); let workerPath = $state(''); let workerExpiry = $state(''); let deleteDialog = $state<HTMLDialogElement>();
 
-  async function auth(kind: 'setup'|'login') { error=''; loading=true; try { await request(`/api/${kind}`, { method:'POST', body: JSON.stringify(kind === 'setup' ? setup : { passphrase }) }); await loadSession(); await loadDashboard(); } catch(e){ error=e instanceof Error?e.message:'Could not open the vault.'; } finally{loading=false;} }
+  async function openSignIn() { error=''; loading=true; try { await signIn(); } catch(e){ error=e instanceof Error?e.message:'Sociobot sign-in could not be opened.'; loading=false; } }
   async function loadDashboard() { if(!session.authenticated) return; loading=true; error=''; try { const [b,f] = await Promise.all([request('/api/bookings'),request('/api/form')]) as [{bookings:Booking[]},{fields:Field[]}]; bookings=b.bookings; fields=f.fields; } catch(e){error=e instanceof Error?e.message:'Could not load the vault.';} finally{loading=false;} }
   async function openBooking(id:string) { loading=true; try { selected=await request(`/api/bookings/${id}`); preview=await request(`/api/bookings/${id}/preview`); workerName=selected.worker_name||''; workerPath=''; } catch(e){error=e instanceof Error?e.message:'Could not open this booking.';} finally{loading=false;} }
   async function saveForm() { error=''; notice=''; if(!licenseValid && fields.length>8){error='The free vault supports 8 questions. Remove extra fields or unlock a Route pass.';return;} loading=true; try{await request('/api/form',{method:'PUT',body:JSON.stringify({fields})});notice='Booking form saved. New submissions will use this route.';}catch(e){error=e instanceof Error?e.message:'Could not save the form.';}finally{loading=false;} }
@@ -25,38 +25,33 @@
   async function copyLink(){await navigator.clipboard.writeText(`${location.origin}${workerPath}`);notice='Worker link copied.';}
   async function updateStatus(status:string){if(!selected)return;await request(`/api/bookings/${selected.id}/status`,{method:'PUT',body:JSON.stringify({status})});selected={...selected,status};await loadDashboard();notice='Job status updated.';}
   async function removeBooking(){if(!selected)return;await request(`/api/bookings/${selected.id}`,{method:'DELETE'});deleteDialog?.close();selected=null;preview=null;await loadDashboard();notice='Booking and its worker link were permanently deleted.';}
-  async function logout(){await request('/api/logout',{method:'POST',body:'{}'});await loadSession();selected=null;}
-  onMount(loadDashboard);
+  async function logout(){await signOut();await loadSession();selected=null;}
+  async function exportCsv(){
+    error='';
+    try {
+      const headers = new Headers(); const token = await accessToken(); const testOid = testOwnerOid();
+      if(token) headers.set('authorization',`Bearer ${token}`); if(testOid) headers.set('x-test-oid',testOid);
+      const response=await fetch('/api/bookings/export.csv',{headers});
+      if(!response.ok) throw new Error((await response.json()).error||'The export could not be prepared.');
+      const url=URL.createObjectURL(await response.blob()); const link=document.createElement('a'); link.href=url; link.download='private-intake-export.csv'; link.click(); URL.revokeObjectURL(url); notice='CSV export downloaded.';
+    } catch(e){error=e instanceof Error?e.message:'The export could not be prepared.';}
+  }
+  onMount(async()=>{await loadSession();await loadDashboard();});
 </script>
 
-{#if !session.configured && session.setup_allowed !== false}
-  <section class="auth-shell">
-    <div class="auth-copy"><p class="eyebrow">Manager vault · first stop</p><h1>Set the rules<br />before details arrive.</h1><p>Create the single manager passphrase, choose a privacy region and set when submissions disappear.</p><ul><li>Passphrase stored as a one-way hash</li><li>Worker links expire automatically</li><li>No booking IDs in application logs</li></ul></div>
-    <form onsubmit={(e)=>{e.preventDefault();auth('setup')}} class="paper-form">
-      <h2>Open the vault</h2>
-      <label for="business">Business name</label><input id="business" bind:value={setup.business_name} required minlength="2" maxlength="80" />
-      <label for="setup-pass">Manager passphrase <span>12+ characters</span></label><input id="setup-pass" type="password" bind:value={setup.passphrase} required minlength="12" autocomplete="new-password" />
-      <label for="timezone">Timezone</label><input id="timezone" bind:value={setup.timezone} required />
-      <label for="region">Privacy region</label><select id="region" bind:value={setup.region}>{#each ['United States','United Kingdom','European Union','Canada','Australia','Other'] as region}<option>{region}</option>{/each}</select>
-      <label for="retention">Delete submissions after</label><select id="retention" bind:value={setup.deletion_days}><option value={7}>7 days</option><option value={14}>14 days</option><option value={30}>30 days</option><option value={60}>60 days</option><option value={90}>90 days</option></select>
-      {#if error}<p class="form-error" role="alert">{error}</p>{/if}<button disabled={loading}>{loading?'Creating vault…':'Create manager vault'}</button>
-    </form>
-  </section>
-{:else if !session.configured}
-  <section class="state-screen compact" role="status"><p class="eyebrow">Manager vault · controlled setup</p><h1>This vault is awaiting its owner.</h1><p>Production setup is locked. Ask the deployment owner to supply the initial manager configuration.</p></section>
-{:else if !session.authenticated}
-  <section class="auth-shell login-shell"><div class="auth-copy"><p class="eyebrow">Manager-only route</p><h1>Return to<br />the vault.</h1><p>Worker assignment links never grant access here.</p></div><form onsubmit={(e)=>{e.preventDefault();auth('login')}} class="paper-form"><h2>Manager sign in</h2><p class="auth-scope">This passphrase opens this team’s single vault. It is not a Sociobot account sign-in.</p><label for="passphrase">Passphrase</label><input id="passphrase" type="password" bind:value={passphrase} required autocomplete="current-password" />{#if error}<p class="form-error" role="alert">{error}</p>{/if}<button disabled={loading}>{loading?'Checking…':'Open the vault'}</button></form></section>
+{#if !session.authenticated}
+  <section class="auth-shell login-shell"><div class="auth-copy"><p class="eyebrow">Manager-only access</p><h1>Sign in to manage bookings</h1><p>Worker assignment links never grant manager access.</p><ul><li>One Sociobot account owns this vault</li><li>Worker links expire automatically</li><li>Public clients need no account</li></ul></div><div class="paper-form"><h2>Manager sign in</h2><p class="auth-scope">Sign-in is provided only by Sociobot Microsoft Entra External ID. This app does not store a manager password.</p>{#if error}<p class="form-error" role="alert">{error}</p>{/if}<button onclick={openSignIn} disabled={loading}>{loading?'Opening Sociobot…':'Sign in with Sociobot'}</button></div></section>
 {:else}
   <section class="vault-shell">
-    <header class="vault-heading"><div><p class="eyebrow">Manager vault · {session.workspace?.business_name}</p><h1>{selected ? 'Booking detail' : mode==='jobs'?'Arrival board':mode==='form'?'Form routing':'Route pass'}</h1></div><div class="vault-tools"><a href="/book" target="_blank" rel="noreferrer">Open public form ↗</a><button class="quiet" onclick={logout}>Sign out</button></div></header>
+    <header class="vault-heading"><div><p class="eyebrow">Manager vault · {session.workspace?.business_name}</p><h1>{selected ? 'Booking detail' : mode==='jobs'?'Bookings':mode==='form'?'Form routing':'Route pass'}</h1></div><div class="vault-tools"><a href="/book" target="_blank" rel="noreferrer">Open public form ↗</a><button class="quiet" onclick={logout}>Sign out</button></div></header>
     <nav class="tab-list" aria-label="Vault sections"><button class:active={mode==='jobs'} onclick={()=>{mode='jobs';selected=null}}>Bookings <span>{bookings.length}</span></button><button class:active={mode==='form'} onclick={()=>{mode='form';selected=null}}>Form routing</button><button class:active={mode==='pass'} onclick={()=>{mode='pass';selected=null}}>Route pass {#if licenseValid}<span>Active</span>{/if}</button></nav>
     {#if !navigator.onLine}<div class="inline-alert" role="status">Offline: reconnect to edit the vault.</div>{/if}
     {#if error}<div class="inline-alert error" role="alert">{error}<button aria-label="Dismiss error" onclick={()=>error=''}>×</button></div>{/if}
     {#if notice}<div class="inline-alert success" role="status">{notice}<button aria-label="Dismiss notice" onclick={()=>notice=''}>×</button></div>{/if}
-    {#if loading}<div class="progress" role="status">Working on that route…</div>{/if}
+    {#if loading}<div class="progress" role="status">Saving your changes…</div>{/if}
 
     {#if selected}
-      <button class="back-link" onclick={()=>{selected=null;preview=null}}>← Back to arrivals</button>
+      <button class="back-link" onclick={()=>{selected=null;preview=null}}>← Back to bookings</button>
       <div class="booking-layout">
         <article class="booking-full"><header><div><span class="status status-{selected.status}">{selected.status==='new'?'New request':selected.status==='assigned'?'Worker assigned':'Complete'}</span><h2>{selected.summary||selected.responses?.[0]?.value||'Booking request'}</h2><p>Received {formatDate(selected.created_at,true)} · deletes {formatDate(selected.delete_at)}</p></div><select aria-label="Job status" value={selected.status} onchange={(e)=>updateStatus(e.currentTarget.value)}><option value="new">New request</option><option value="assigned">Worker assigned</option><option value="complete">Complete</option></select></header>
           <h3>Manager’s complete record</h3><dl class="response-list">{#each selected.responses||[] as item}<div><dt>{item.label_snapshot} <span class="badge {item.visibility_snapshot==='worker'?'worker-badge':'admin-badge'}">{item.visibility_snapshot==='worker'?'◎ Worker sees':'◆ Manager only'}</span></dt><dd>{item.value}</dd></div>{/each}</dl>
@@ -68,8 +63,8 @@
       </div>
       <dialog bind:this={deleteDialog}><form method="dialog"><p class="eyebrow coral">Permanent deletion</p><h2>Delete this booking?</h2><p>This removes every answer and invalidates its worker link immediately. It cannot be undone.</p><div class="dialog-actions"><button value="cancel" class="secondary">Keep booking</button><button value="confirm" class="danger-button" onclick={(e)=>{e.preventDefault();removeBooking()}}>Delete permanently</button></div></form></dialog>
     {:else if mode==='jobs'}
-      <div class="board-actions"><p>{bookings.length ? 'Select an arrival to prepare its least-privilege worker brief.' : 'New submissions will appear here.'}</p><a class="secondary button-like" href="/api/bookings/export.csv">Export CSV</a></div>
-      {#if bookings.length}<ul class="arrival-board">{#each bookings as booking}<li><button onclick={()=>openBooking(booking.id)}><span class="board-date">{formatDate(booking.created_at)}</span><strong>{booking.summary}</strong><span class="status status-{booking.status}">{booking.status==='new'?'New':booking.status==='assigned'?'Assigned':'Complete'}</span><span class="board-delete">Deletes {formatDate(booking.delete_at)}</span><span aria-hidden="true">→</span></button></li>{/each}</ul>{:else}<div class="empty-state"><span class="empty-symbol" aria-hidden="true">◇</span><h2>No arrivals yet</h2><p>Open the public form, send yourself a test request, and it will arrive on this board.</p><a class="button-like" href="/book" target="_blank">Open booking form ↗</a></div>{/if}
+      <div class="board-actions"><p>{bookings.length ? 'Select a booking to prepare its worker brief.' : 'New submissions will appear here.'}</p><button class="secondary" onclick={exportCsv}>Export CSV</button></div>
+      {#if bookings.length}<ul class="arrival-board">{#each bookings as booking}<li><button onclick={()=>openBooking(booking.id)}><span class="board-date">{formatDate(booking.created_at)}</span><strong>{booking.summary}</strong><span class="status status-{booking.status}">{booking.status==='new'?'New':booking.status==='assigned'?'Assigned':'Complete'}</span><span class="board-delete">Deletes {formatDate(booking.delete_at)}</span><span aria-hidden="true">→</span></button></li>{/each}</ul>{:else}<div class="empty-state"><span class="empty-symbol" aria-hidden="true">◇</span><h2>No bookings yet</h2><p>Open the public form and send a test request. The booking will appear here.</p><a class="button-like" href="/book" target="_blank">Open booking form ↗</a></div>{/if}
     {:else if mode==='form'}
       <div class="form-builder-intro"><div><h2>Decide where every answer goes</h2><p>The visibility saved at submission stays with that answer, even if this form changes later.</p></div><div class="legend"><span class="badge worker-badge">◎ Worker sees</span><span class="badge admin-badge">◆ Manager only</span></div></div>
       <div class="field-builder">{#each fields as field,index}<fieldset><legend>Question {String(index+1).padStart(2,'0')}</legend><div class="field-main"><label for={`label-${index}`}>Label</label><input id={`label-${index}`} bind:value={field.label} maxlength="60" /><label for={`type-${index}`}>Answer type</label><select id={`type-${index}`} bind:value={field.field_type}><option value="text">Short text</option><option value="textarea">Long text</option><option value="email">Email</option><option value="tel">Phone</option><option value="date">Date</option><option value="time">Time</option><option value="select">Choice list</option></select>{#if field.field_type==='select'}<label for={`options-${index}`}>Choices <span>one per line</span></label><textarea id={`options-${index}`} value={field.options.join('\n')} onchange={(e)=>field.options=e.currentTarget.value.split('\n').map(v=>v.trim()).filter(Boolean)} rows="3"></textarea>{/if}</div><div class="field-controls"><label class="check"><input type="checkbox" bind:checked={field.required} /> Required</label><div class="segmented"><button type="button" class:active={field.visibility==='worker'} onclick={()=>field.visibility='worker'}>◎ Worker sees</button><button type="button" class:active={field.visibility==='admin'} onclick={()=>field.visibility='admin'}>◆ Manager only</button></div><div class="icon-actions"><button aria-label="Move question up" disabled={index===0} onclick={()=>move(index,-1)}>↑</button><button aria-label="Move question down" disabled={index===fields.length-1} onclick={()=>move(index,1)}>↓</button><button aria-label="Remove question" disabled={fields.length<=2} onclick={()=>fields=fields.filter((_,i)=>i!==index)}>×</button></div></div></fieldset>{/each}</div>

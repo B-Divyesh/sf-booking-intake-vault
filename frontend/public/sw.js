@@ -1,7 +1,7 @@
 // Bump whenever the application shell changes so offline reloads cannot keep
 // serving an older JavaScript entrypoint after a release.
-const CACHE = 'private-intake-shell-v4';
-const SHELL = ['/', '/favicon.svg', '/assets/private-routes-720.webp', '/assets/private-routes-1200.webp'];
+const CACHE = 'private-intake-shell-v5';
+const SHELL = ['/', '/demo', '/favicon.svg', '/apple-touch-icon.png', '/assets/private-routes-720.webp', '/assets/private-routes-1200.webp', '/assets/private-routes-social.webp'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)));

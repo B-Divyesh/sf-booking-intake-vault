@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://booking-intake-vault.sociobot.in/sitemap.xml

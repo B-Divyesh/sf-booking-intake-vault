@@ -5,7 +5,7 @@ RUN npm ci
 COPY frontend ./frontend
 RUN npm run build:web
 
-FROM rust:1-bookworm AS rust-builder
+FROM rust:1-slim-bookworm AS rust-builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY migrations ./migrations
@@ -14,6 +14,8 @@ RUN cargo build --release --locked
 
 FROM debian:bookworm-slim AS runtime
 ARG BUILD_SHA=dev
+ARG GIT_SHA=dev
+ARG SOURCE_COMMIT=dev
 RUN groupadd --system private-intake && useradd --system --gid private-intake --home-dir /app private-intake \
     && mkdir -p /app/frontend /data \
     && chown -R private-intake:private-intake /app /data

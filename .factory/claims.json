@@ -1,0 +1,121 @@
+[
+  {
+    "id": "zero-config",
+    "claim": "The booking form is ready when the container starts with only PORT.",
+    "where": "README runtime configuration",
+    "test": "npm run test:e2e -- --grep @claim:zero-config",
+    "sandbox": "Fresh temporary SQLite database; test server receives PORT plus a test-only Entra identity switch."
+  },
+  {
+    "id": "demo-isolation",
+    "claim": "The one-click demo uses isolated sample data and does not change real bookings.",
+    "where": "Landing primary action and demo banner",
+    "test": "npm run test:e2e -- --grep @claim:demo-isolation",
+    "sandbox": "Fresh browser context opens /demo, compares real booking count, checks separated views, and resets to a new ephemeral workspace."
+  },
+  {
+    "id": "server-field-redaction",
+    "claim": "The server omits manager-only answers from worker briefs.",
+    "where": "Landing, demo, privacy page, and README",
+    "test": "npm run test:e2e -- --grep @claim:server-field-redaction",
+    "sandbox": "Public submission with private markers; manager preview and worker API are checked for absence of both markers."
+  },
+  {
+    "id": "automatic-deletion",
+    "claim": "Every submitted booking receives the configured deletion date.",
+    "where": "Landing, booking form, privacy page, and README",
+    "test": "cargo test tests::claim_automatic_deletion",
+    "sandbox": "A temporary SQLite vault contains expired and live bookings; purge removes only the expired booking and its dependent worker token."
+  },
+  {
+    "id": "worker-link-expiry",
+    "claim": "Worker links expire and reveal only permitted job facts.",
+    "where": "Landing, demo, manager vault, privacy page, and README",
+    "test": "npm run test:e2e -- --grep @claim:worker-link-expiry",
+    "sandbox": "A real 48-hour assignment link is created from a public submission and its worker response is inspected."
+  },
+  {
+    "id": "csv-export",
+    "claim": "Managers can export bookings as spreadsheet-safe CSV.",
+    "where": "Manager vault and README",
+    "test": "npm run test:e2e -- --grep @claim:csv-export",
+    "sandbox": "A public formula-leading client value is submitted and the authenticated CSV bytes must prefix it with an apostrophe."
+  },
+  {
+    "id": "no-trackers",
+    "claim": "The product loads no trackers or third-party runtime scripts.",
+    "where": "Landing, privacy page, and README",
+    "test": "npm run test:e2e -- --grep @claim:no-trackers",
+    "sandbox": "A complete demo load and reset records every browser request and allows only the product origin."
+  },
+  {
+    "id": "offline-reload",
+    "claim": "The sample remains available offline after the first visit.",
+    "where": "Landing and README",
+    "test": "npm run test:e2e -- --grep @claim:offline-reload",
+    "sandbox": "Dedicated browser context loads /demo, confirms service-worker control, goes offline, reloads, and checks the cached sample."
+  },
+  {
+    "id": "entra-manager",
+    "claim": "Manager access uses Sociobot Microsoft Entra External ID only.",
+    "where": "Manager sign-in, privacy page, and README",
+    "test": "npm run test:e2e -- --grep @claim:entra-manager",
+    "sandbox": "Signed-out browser observes the Sociobot CIAM authority request; a different Entra oid is denied by the server."
+  },
+  {
+    "id": "paid-boundaries",
+    "claim": "Core tools are free; US$29 once adds up to 12 questions and longer worker links.",
+    "where": "Landing, manager Route pass, terms, and README",
+    "test": "npm run test:e2e -- --grep @claim:paid-boundaries",
+    "sandbox": "Fresh free workspace keeps 8 questions, rejects a ninth and a 14-day link without a verified license, and shows the exact hosted offer."
+  },
+  {
+    "id": "rate-limits",
+    "claim": "API identity checks are rate limited per first forwarded client IP and return Retry-After.",
+    "where": "README operations",
+    "test": "npm run test:e2e -- --grep @claim:rate-limits",
+    "sandbox": "Twenty requests from one forwarded address succeed, request 21 returns 429 with Retry-After, and another address remains allowed."
+  },
+  {
+    "id": "response-policy",
+    "claim": "Error responses retain the product security and no-store headers.",
+    "where": "README privacy and operations",
+    "test": "npm run test:e2e -- --grep @claim:response-policy",
+    "sandbox": "A 70 KB request triggers 413 and asserts CSP, HSTS, nosniff, and Cache-Control headers."
+  },
+  {
+    "id": "route-metadata",
+    "claim": "Every public route has its own title, canonical metadata, and a designed 404 path.",
+    "where": "Site structure",
+    "test": "npm run test:e2e -- --grep @claim:route-metadata",
+    "sandbox": "Direct route and client navigation checks cover 404 status, title, canonical, social image, heading focus, and footer attribution."
+  },
+  {
+    "id": "build-identity",
+    "claim": "The health endpoint and footer expose the deployed build identity.",
+    "where": "README deployment and site footer",
+    "test": "npm run test:e2e -- --grep @claim:build-identity",
+    "sandbox": "The clean test service returns the supplied build SHA and serves every recognized route."
+  },
+  {
+    "id": "mobile-keyboard",
+    "claim": "The interface keeps 44px targets at 390px and provides visible keyboard focus.",
+    "where": "README and accessibility contract",
+    "test": "npm run test:e2e -- --grep @claim:mobile-keyboard",
+    "sandbox": "A 390px viewport checks visible links on home and legal pages, then tabs to the skip link and inspects its focus outline."
+  },
+  {
+    "id": "token-hashing",
+    "claim": "Worker assignment tokens are stored only as hashes.",
+    "where": "Privacy page and README",
+    "test": "cargo test tests::tokens_are_never_stored_verbatim",
+    "sandbox": "A generated worker token is compared with its stored-format SHA-256 digest."
+  },
+  {
+    "id": "durable-snapshot",
+    "claim": "A mounted durable snapshot restores the last committed local vault copy.",
+    "where": "README runtime configuration and deployment guide",
+    "test": "cargo test tests::durable_snapshot_restores_the_last_local_vault_copy",
+    "sandbox": "Temporary working and backup files prove copy-out and restore after replacement."
+  }
+]
