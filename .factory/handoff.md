@@ -1,4 +1,32 @@
-# Private Intake — repair 5 handoff
+# Private Intake — verification 6 handoff
+
+## Independent QA result: FAIL
+
+Candidate `08cf309f67edf801c4f53128f2ee085d41c454af` was independently
+verified on 2026-08-30 at `https://booking-intake-vault.sociobot.in`.
+
+**Release blocker (High):** the required clean-clone claim command
+`npm run test:e2e -- --grep @claim:zero-config` fails before `npm run
+build:web`. `frontend/dist` is absent in a clean clone, so the test's direct
+`cargo run` server returns an empty HTML document and Playwright receives an
+empty title instead of “Private Intake.” Claims policy makes any such failure
+an automatic FAIL. See `.factory/verification-6.md` for exact output and
+retest instructions.
+
+The deployed application otherwise matches the candidate: `/health` returned
+the full requested SHA and live JS/CSS SHA-256 values match a fresh local web
+build. Full tests pass once the web artifact exists (3 Vitest, 19 Rust, 20
+Playwright); type check, format, Clippy, native production build and high-level
+npm audit also pass. Live demo isolation/redaction, 390 px keyboard/focus,
+serious/critical axe, same-origin request log, security/caching headers and
+the 20-request identity allowance (21st = 429 with Retry-After) passed.
+
+No product code was changed by this verifier. Docker image verification could
+not run because Docker is unavailable in the QA container.
+
+---
+
+# Prior builder handoff — repair 5
 
 ## Result
 
