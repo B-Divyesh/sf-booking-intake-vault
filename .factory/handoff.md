@@ -112,9 +112,14 @@ Live checks at `https://booking-intake-vault.sociobot.in` showed:
 - A 70 KB live request returned 413 with CSP, HSTS, nosniff, and no-store.
   The identity bucket allowed 20 requests, then returned 429 with
   `Retry-After` while a new forwarded client remained independent.
+- A 300-request health smoke at full concurrency returned 300 correct responses
+  in 795 ms (377 requests/second), exceeding the 100 requests/second check.
 - `verify-url.sh` passed all six public routes without browser console errors;
   robots and sitemap return 200, unknown pages return the designed 404, and
   the footer/health expose the final build.
+- Live mobile Lighthouse scored 99/100/100/100 on both the landing page and
+  booking route. Landing LCP was 1,680 ms with CLS 0; booking LCP was 1,592 ms
+  with CLS 0.
 - A fresh live service-worker context activated the current cache, updated
   without a waiting worker, then reloaded `/demo` offline with the sample.
 
