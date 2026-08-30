@@ -19,7 +19,12 @@
 </script>
 
 {#if loading}
-  <section class="state-screen" aria-busy="true"><div class="route-loader" aria-hidden="true"><i></i><i></i><i></i></div><h1>Opening the booking desk</h1><p>Loading the team’s questions…</p></section>
+  <section class="form-shell booking-route" aria-busy="true" aria-live="polite">
+    <div class="form-intro"><p class="eyebrow">Booking request</p><h1>Tell the team<br />about the job.</h1><p>Loading the team’s questions…</p></div>
+    <div class="paper-form booking-form-skeleton" aria-hidden="true">
+      {#each Array(7) as _}<span></span>{/each}
+    </div>
+  </section>
 {:else if error && !form}
   <section class="state-screen compact" role="alert"><p class="eyebrow">Route interrupted</p><h1>The booking desk is unavailable</h1><p>{error}</p><button onclick={load}>Try again</button></section>
 {:else if complete}
@@ -30,7 +35,7 @@
     <button class="secondary" onclick={() => navigate('/')}>Return to Private Intake</button>
   </section>
 {:else if form}
-  <section class="form-shell">
+  <section class="form-shell booking-route">
     <div class="form-intro"><p class="eyebrow">Hosted securely for {form.business_name}</p><h1>Tell the team<br />about the job.</h1><p>Fields marked “required” must be completed. Your manager decides what the assigned worker can see.</p></div>
     <form onsubmit={submit}>
       <div class="form-route" aria-hidden="true"><i></i><span>01</span><span>02</span><span>03</span></div>

@@ -88,6 +88,9 @@
 
 <svelte:head>
   <title>{path === '/book' ? 'Book a service' : path.startsWith('/worker/') ? 'Worker job brief' : path === '/admin' ? 'Manager vault' : path === '/privacy' ? 'Privacy notice' : path === '/terms' ? 'Terms of use' : 'Private Intake — least-privilege booking forms'}</title>
+  {#if path === '/'}
+    <link rel="preload" as="image" href="/assets/private-routes-1200.webp" imagesrcset="/assets/private-routes-720.webp 720w, /assets/private-routes-1200.webp 1200w" imagesizes="(max-width: 700px) calc(100vw - 28px), min(56vw, 700px)" fetchpriority="high" />
+  {/if}
 </svelte:head>
 
 <header class="site-header">

@@ -40,6 +40,17 @@ const SESSION_DAYS: i64 = 14;
 const FREE_FIELD_LIMIT: usize = 8;
 const FREE_LINK_HOURS: i64 = 48;
 const LICENSE_HEADER: &str = "x-route-license";
+const RATE_WINDOW: StdDuration = StdDuration::from_secs(60);
+const API_RATE_LIMIT: usize = 120;
+const AUTH_RATE_LIMIT: usize = 20;
+const WRITE_RATE_LIMIT: usize = 60;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum RateClass {
+    Api,
+    Auth,
+    Write,
+}
 
 struct AppState {
     db: SqlitePool,
@@ -48,7 +59,7 @@ struct AppState {
     production: bool,
     build_sha: String,
     static_dir: PathBuf,
-    rate_windows: Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
+    rate_windows: Mutex<HashMap<(IpAddr, RateClass), VecDeque<Instant>>>,
     license_cache: Mutex<HashMap<String, CachedLicense>>,
     billing_base: String,
     http: reqwest::Client,
@@ -71,34 +82,50 @@ enum AppError {
     #[error("service error")]
     Internal,
     #[error("too many requests")]
-    RateLimited,
+    RateLimited(u64),
     #[error("route pass required")]
     PaymentRequired,
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "Sign in to continue.".to_string()),
+        let (status, message, retry_after) = match self {
+            Self::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "Sign in to continue.".to_string(),
+                None,
+            ),
             Self::NotFound => (
                 StatusCode::NOT_FOUND,
                 "That item was not found or has expired.".to_string(),
+                None,
             ),
-            Self::Validation(message) => (StatusCode::UNPROCESSABLE_ENTITY, message),
+            Self::Validation(message) => (StatusCode::UNPROCESSABLE_ENTITY, message, None),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Private Intake could not complete that request. Try again.".to_string(),
+                None,
             ),
-            Self::RateLimited => (
+            Self::RateLimited(seconds) => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "Too many requests from this connection. Wait a minute and try again.".to_string(),
+                Some(seconds),
             ),
             Self::PaymentRequired => (
                 StatusCode::PAYMENT_REQUIRED,
                 "A valid Route pass is required for more than 8 questions or worker links longer than 48 hours.".to_string(),
+                None,
             ),
         };
-        (status, Json(json!({ "error": message }))).into_response()
+        let mut response = (status, Json(json!({ "error": message }))).into_response();
+        if let Some(seconds) = retry_after {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                HeaderValue::from_str(&seconds.to_string())
+                    .expect("retry delay is a valid header value"),
+            );
+        }
+        response
     }
 }
 
@@ -272,9 +299,15 @@ async fn main() {
         .map(|v| v == "production")
         .unwrap_or(false);
     let bootstrap_supplied = env::var_os("INITIAL_ADMIN_PASSPHRASE").is_some();
+    let manager_passphrase = env::var("MANAGER_PASSPHRASE").ok();
     initialize_workspace_from_env(&db)
         .await
         .expect("workspace initialization");
+    if let Some(passphrase) = manager_passphrase.as_deref() {
+        apply_manager_passphrase(&db, passphrase)
+            .await
+            .expect("manager credential override");
+    }
     if let Err(error) =
         persist_database_file(database_file.as_deref(), backup_file.as_deref()).await
     {
@@ -287,6 +320,11 @@ async fn main() {
             "generated-default"
         },
         bootstrap = if bootstrap_supplied {
+            "supplied"
+        } else {
+            "not-supplied"
+        },
+        manager_credential = if manager_passphrase.is_some() {
             "supplied"
         } else {
             "not-supplied"
@@ -327,7 +365,6 @@ async fn main() {
 
 fn app(state: Arc<AppState>) -> Router {
     let api = Router::new()
-        .route("/health", get(health))
         .route("/api/setup", post(setup))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
@@ -344,7 +381,10 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/api/bookings/{id}/assign", post(assign_worker))
         .route("/api/bookings/{id}/status", put(update_status))
         .route("/api/worker/{token}", get(worker_brief))
-        .with_state(state.clone());
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_api,
+        ));
 
     // Serve the application shell only for client routes that actually exist.
     // `ServeDir::not_found_service` keeps a 404 status even when it sends the
@@ -355,16 +395,69 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/admin", get(spa_index))
         .route("/privacy", get(spa_index))
         .route("/terms", get(spa_index))
-        .route("/worker/{token}", get(spa_index))
-        .with_state(state.clone());
+        .route("/worker/{token}", get(spa_index));
 
-    api.merge(client_routes)
+    Router::new()
+        .route("/health", get(health))
+        .merge(api)
+        .merge(client_routes)
         .fallback_service(ServeDir::new(state.static_dir.clone()))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             snapshot_after_api_request,
         ))
         .layer(middleware::from_fn(security_headers))
+        .with_state(state)
+}
+
+/// Apply a shared per-client ceiling to every API route, with stricter
+/// buckets for authentication and writes. Azure Container Apps forwards the
+/// originating address in the first `X-Forwarded-For` entry, so the limiter
+/// must not collapse every visitor into the ingress proxy's socket address.
+async fn rate_limit_api(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let ip = client_ip(&request);
+    if let Err(error) = enforce_rate(&state, ip, RateClass::Api, API_RATE_LIMIT).await {
+        return error.into_response();
+    }
+
+    let path = request.uri().path();
+    let scoped_limit = if matches!(path, "/api/setup" | "/api/login") {
+        Some((RateClass::Auth, AUTH_RATE_LIMIT))
+    } else if request.method() != axum::http::Method::GET
+        && request.method() != axum::http::Method::HEAD
+        && request.method() != axum::http::Method::OPTIONS
+    {
+        Some((RateClass::Write, WRITE_RATE_LIMIT))
+    } else {
+        None
+    };
+    if let Some((class, limit)) = scoped_limit {
+        if let Err(error) = enforce_rate(&state, ip, class, limit).await {
+            return error.into_response();
+        }
+    }
+    next.run(request).await
+}
+
+fn client_ip(request: &Request<Body>) -> IpAddr {
+    request
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .and_then(|value| value.parse().ok())
+        .or_else(|| {
+            request
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ConnectInfo(peer)| peer.ip())
+        })
+        .unwrap_or(IpAddr::from([0, 0, 0, 0]))
 }
 
 /// Persist the local SQLite snapshot only after a successful API response. The
@@ -501,10 +594,8 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
 
 async fn setup(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(input): Json<SetupInput>,
 ) -> Result<Response, AppError> {
-    enforce_rate(&state, peer.ip(), 20).await?;
     if state.production {
         return Err(AppError::Unauthorized);
     }
@@ -530,10 +621,8 @@ async fn setup(
 
 async fn login(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(input): Json<LoginInput>,
 ) -> Result<Response, AppError> {
-    enforce_rate(&state, peer.ip(), 20).await?;
     let stored: Option<String> =
         sqlx::query_scalar("SELECT passphrase_hash FROM workspaces WHERE id = 1")
             .fetch_optional(&state.db)
@@ -692,10 +781,8 @@ async fn public_form(State(state): State<Arc<AppState>>) -> Result<Json<Value>, 
 
 async fn create_booking(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(input): Json<BookingInput>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    enforce_rate(&state, peer.ip(), 60).await?;
     if !input.website.is_empty() {
         return Ok((StatusCode::CREATED, Json(json!({ "received": true }))));
     }
@@ -1258,6 +1345,43 @@ async fn initialize_workspace_from_bootstrap(
     Ok(())
 }
 
+/// Keep the deployment owner credential recoverable without putting it in the
+/// image or repository. Supplying this optional platform secret updates an
+/// existing vault as well as a freshly bootstrapped one and revokes old
+/// sessions whenever the credential changes.
+async fn apply_manager_passphrase(db: &SqlitePool, passphrase: &str) -> Result<(), AppError> {
+    if passphrase.len() < 12 {
+        return Err(AppError::Validation(
+            "The manager passphrase must contain at least 12 characters.".into(),
+        ));
+    }
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT passphrase_hash FROM workspaces WHERE id = 1")
+            .fetch_optional(db)
+            .await?;
+    let Some(stored) = stored else {
+        return Ok(());
+    };
+    if PasswordHash::new(&stored).ok().is_some_and(|hash| {
+        Argon2::default()
+            .verify_password(passphrase.as_bytes(), &hash)
+            .is_ok()
+    }) {
+        return Ok(());
+    }
+    let mut tx = db.begin().await?;
+    sqlx::query("UPDATE workspaces SET passphrase_hash = ? WHERE id = 1")
+        .bind(hash_passphrase(passphrase)?)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM sessions")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    info!("manager credential synchronized from supplied configuration");
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct LicenseResponse {
     valid: bool,
@@ -1337,18 +1461,32 @@ fn valid_id(id: &str) -> bool {
         })
 }
 
-async fn enforce_rate(state: &AppState, ip: IpAddr, limit: usize) -> Result<(), AppError> {
+async fn enforce_rate(
+    state: &AppState,
+    ip: IpAddr,
+    class: RateClass,
+    limit: usize,
+) -> Result<(), AppError> {
     let now = Instant::now();
     let mut windows = state.rate_windows.lock().await;
-    let attempts = windows.entry(ip).or_default();
+    let attempts = windows.entry((ip, class)).or_default();
     while attempts
         .front()
-        .is_some_and(|seen| now.duration_since(*seen) > StdDuration::from_secs(60))
+        .is_some_and(|seen| now.duration_since(*seen) >= RATE_WINDOW)
     {
         attempts.pop_front();
     }
     if attempts.len() >= limit {
-        return Err(AppError::RateLimited);
+        let retry_after = attempts
+            .front()
+            .map(|seen| {
+                RATE_WINDOW
+                    .saturating_sub(now.duration_since(*seen))
+                    .as_secs()
+                    .max(1)
+            })
+            .unwrap_or(1);
+        return Err(AppError::RateLimited(retry_after));
     }
     attempts.push_back(now);
     Ok(())
@@ -1391,6 +1529,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
     use tower::ServiceExt;
 
     async fn test_state(static_dir: PathBuf) -> Arc<AppState> {
@@ -1467,7 +1606,6 @@ mod tests {
         Arc::get_mut(&mut state).unwrap().production = true;
         let result = setup(
             State(state),
-            ConnectInfo("127.0.0.1:12345".parse().unwrap()),
             Json(SetupInput {
                 business_name: "Attacker workspace".into(),
                 passphrase: "attacker passphrase".into(),
@@ -1526,6 +1664,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn controlled_bootstrap_makes_the_production_booking_form_available() {
+        let mut state = test_state(PathBuf::new()).await;
+        sqlx::migrate!().run(&state.db).await.unwrap();
+        initialize_workspace_from_bootstrap(
+            &state.db,
+            BootstrapConfig {
+                business_name: "Configured Field Team".into(),
+                passphrase: "a bootstrap passphrase that is long enough".into(),
+                timezone: "UTC".into(),
+                region: "European Union".into(),
+                deletion_days: 14,
+            },
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut state).unwrap().production = true;
+        let service = app(state);
+
+        let session_response = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session_response.status(), StatusCode::OK);
+        let session_body = session_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let session_json: Value = serde_json::from_slice(&session_body).unwrap();
+        assert_eq!(session_json["configured"], true);
+        assert_eq!(session_json["setup_allowed"], false);
+
+        let form_response = service
+            .oneshot(
+                Request::builder()
+                    .uri("/api/form/public")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(form_response.status(), StatusCode::OK);
+        let form_body = form_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let form_json: Value = serde_json::from_slice(&form_body).unwrap();
+        assert_eq!(form_json["available"], true);
+        assert_eq!(form_json["fields"].as_array().unwrap().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn supplied_manager_credential_rotates_the_hash_and_revokes_sessions() {
+        let state = test_state(PathBuf::new()).await;
+        sqlx::migrate!().run(&state.db).await.unwrap();
+        initialize_workspace_from_bootstrap(
+            &state.db,
+            BootstrapConfig {
+                business_name: "Credential Test Team".into(),
+                passphrase: "original manager passphrase".into(),
+                timezone: "UTC".into(),
+                region: "United States".into(),
+                deletion_days: 30,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO sessions (token_hash, expires_at) VALUES ('old', ?)")
+            .bind((Utc::now() + Duration::days(1)).to_rfc3339())
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        apply_manager_passphrase(&state.db, "replacement manager passphrase")
+            .await
+            .unwrap();
+        let stored: String =
+            sqlx::query_scalar("SELECT passphrase_hash FROM workspaces WHERE id = 1")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        let parsed = PasswordHash::new(&stored).unwrap();
+        assert!(Argon2::default()
+            .verify_password(b"replacement manager passphrase", &parsed)
+            .is_ok());
+        assert!(Argon2::default()
+            .verify_password(b"original manager passphrase", &parsed)
+            .is_err());
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(sessions, 0);
+    }
+
+    #[tokio::test]
     async fn startup_migrations_are_safe_to_repeat_for_a_persisted_vault() {
         let db = SqlitePoolOptions::new()
             .max_connections(1)
@@ -1577,6 +1820,114 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(LICENSE_HEADER, HeaderValue::from_static(token));
         assert!(require_route_pass(&state, &headers).await.is_ok());
+    }
+
+    #[test]
+    fn client_identity_uses_the_first_forwarded_hop() {
+        let mut request = Request::builder()
+            .uri("/api/login")
+            .header("x-forwarded-for", "203.0.113.9, 10.0.0.4")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:45678".parse::<SocketAddr>().unwrap(),
+        ));
+        assert_eq!(
+            client_ip(&request),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn login_rate_limit_is_forwarded_ip_aware_and_returns_retry_after() {
+        let state = test_state(PathBuf::new()).await;
+        sqlx::migrate!().run(&state.db).await.unwrap();
+        let service = app(state);
+
+        for attempt in 1..=AUTH_RATE_LIMIT {
+            let response = service
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/login")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("x-forwarded-for", "203.0.113.20, 10.0.0.4")
+                        .body(Body::from(r#"{"passphrase":"invalid passphrase"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "attempt {attempt} should reach the login handler"
+            );
+        }
+
+        let limited = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-forwarded-for", "203.0.113.20, 10.0.0.4")
+                    .body(Body::from(r#"{"passphrase":"invalid passphrase"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(limited.headers().get(header::RETRY_AFTER).is_some());
+
+        let separate_client = service
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-forwarded-for", "203.0.113.21, 10.0.0.4")
+                    .body(Body::from(r#"{"passphrase":"invalid passphrase"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(separate_client.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn every_api_route_has_a_general_rate_limit() {
+        let state = test_state(PathBuf::new()).await;
+        sqlx::migrate!().run(&state.db).await.unwrap();
+        let service = app(state);
+
+        for _ in 0..API_RATE_LIMIT {
+            let response = service
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/session")
+                        .header("x-forwarded-for", "198.51.100.30")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let limited = service
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session")
+                    .header("x-forwarded-for", "198.51.100.30")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(limited.headers().contains_key(header::RETRY_AFTER));
     }
 
     #[tokio::test]

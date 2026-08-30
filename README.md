@@ -21,6 +21,10 @@ Non-goals are calendar sync, payment collection, dispatch optimization and CRM f
 
 The Svelte 5/Vite client is compiled to `frontend/dist`. Axum serves that client and a same-origin JSON API. SQLite stores the single workspace, form configuration, bookings, response visibility snapshots, hashed manager sessions and hashed worker tokens. No booking or worker token is written to application logs.
 
+### Identity boundary
+
+Private Intake is a single-team vault installation, not a shared Sociobot user account. It has one deployment-local manager passphrase and does not provide user registration, multi-team tenancy, or cross-product identity. Workers use narrow, expiring bearer links and never receive manager access. Because no Sociobot identity is required, the Sociobot Entra tenant is deliberately outside this v1 authentication boundary. A future multi-manager or multi-tenant version must replace the local manager credential with Sociobot Entra; it must not add another password system.
+
 ## Run locally
 
 Requirements: Node 22+, npm, Rust 1.88+, and Chromium for the Playwright version pinned in `package.json`.
@@ -65,6 +69,7 @@ Runtime configuration is environment-only:
 - `BUILD_SHA` — returned by `/health` for deployment identification
 - `RUST_LOG` — structured JSON log filter, default `info`
 - `INITIAL_ADMIN_PASSPHRASE` — optional production bootstrap secret; when the database is empty, creates the owner workspace without exposing a public claim endpoint
+- `MANAGER_PASSPHRASE` — optional platform secret that initializes or rotates the single-vault manager credential; use it to keep owner access recoverable across revisions
 - `INITIAL_BUSINESS_NAME`, `INITIAL_TIMEZONE`, `INITIAL_REGION`, `INITIAL_DELETION_DAYS` — optional bootstrap metadata with safe defaults
 - `BILLING_BASE` — optional Sociobot API override for integration testing
 
@@ -78,7 +83,7 @@ The app loads no third-party runtime scripts, fonts or analytics. License verifi
 
 ## Deployment
 
-The factory deploys the root `Dockerfile`; this repository does not manage DNS, billing registration or infrastructure. The Sociobot product is registered after handoff, so the code uses only the documented product slug and contains no product ID or provider secret.
+The factory deploys the root `Dockerfile`; this repository does not manage DNS, billing registration or infrastructure. This stateful product also requires the one-replica Azure Files mount recorded in [`.factory/deployment.md`](.factory/deployment.md); replacing the Container App template with only `PORT` removes the vault. The Sociobot product is registered after handoff, so the code uses only the documented product slug and contains no product ID or provider secret.
 
 ## License
 

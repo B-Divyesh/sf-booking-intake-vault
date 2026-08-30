@@ -91,6 +91,7 @@ test.describe.serial('Private Intake', () => {
     await expect(page.getByRole('heading', { name: /Your details reached/ })).toBeVisible();
 
     await page.goto('/admin');
+    await expect(page.getByText(/not a Sociobot account sign-in/)).toBeVisible();
     await page.getByLabel('Passphrase').fill(passphrase);
     await page.getByRole('button', { name: 'Open the vault' }).click();
     await page.getByRole('button', { name: /A PRIVATE CLIENT/ }).click();
@@ -140,6 +141,29 @@ test.describe.serial('Private Intake', () => {
     expect(dimensions.scroll).toBeLessThanOrEqual(dimensions.client);
   });
 
+  test('keeps the configured mobile booking route stable and skips landing artwork', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.addInitScript(() => {
+      const target = window as Window & { __privateIntakeCls?: number };
+      target.__privateIntakeCls = 0;
+      new PerformanceObserver((list) => {
+        for (const rawEntry of list.getEntries()) {
+          const entry = rawEntry as PerformanceEntry & { hadRecentInput: boolean; value: number };
+          if (!entry.hadRecentInput) target.__privateIntakeCls = (target.__privateIntakeCls || 0) + entry.value;
+        }
+      }).observe({ type: 'layout-shift', buffered: true });
+    });
+    await page.goto('/book');
+    await expect(page.getByRole('heading', { name: /Tell the team/ })).toBeVisible();
+    await page.waitForTimeout(500);
+    const result = await page.evaluate(() => ({
+      cls: (window as Window & { __privateIntakeCls?: number }).__privateIntakeCls || 0,
+      resources: performance.getEntriesByType('resource').map((entry) => entry.name),
+    }));
+    expect(result.cls).toBeLessThan(0.1);
+    expect(result.resources.some((url) => url.includes('private-routes-'))).toBe(false);
+  });
+
   test('keeps mobile navigation and legal links at least 44px tall', async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     for (const route of ['/', '/privacy', '/terms']) {
@@ -165,10 +189,43 @@ test.describe.serial('Private Intake', () => {
     await page.goto('/book');
     await expect(page.getByRole('heading', { name: /Tell the team/ })).toBeVisible();
     await expect.poll(() => page.evaluate(() => navigator.serviceWorker.controller?.scriptURL || '')).toContain('/sw.js');
+    const updateState = await page.evaluate(async () => {
+      const registration = await navigator.serviceWorker.getRegistration();
+      await registration?.update();
+      return {
+        waiting: Boolean(registration?.waiting),
+        caches: await caches.keys(),
+      };
+    });
+    expect(updateState.waiting).toBe(false);
+    expect(updateState.caches).toContain('private-intake-shell-v4');
     await page.context().setOffline(true);
     await page.reload();
     await expect(page.getByRole('heading', { name: /booking desk is unavailable/ })).toBeVisible();
     expect(errors.filter((message) => /ERR_INTERNET_DISCONNECTED/i.test(message))).toEqual([]);
     await page.context().setOffline(false);
+  });
+
+  test('limits login by first forwarded IP and includes Retry-After on 429', async ({ page }) => {
+    const headers = { 'x-forwarded-for': '203.0.113.90, 10.0.0.4' };
+    for (let attempt = 1; attempt <= 20; attempt += 1) {
+      const response = await page.request.post('/api/login', {
+        headers,
+        data: { passphrase: 'deliberately invalid passphrase' },
+      });
+      expect(response.status(), `attempt ${attempt}`).toBe(401);
+    }
+    const limited = await page.request.post('/api/login', {
+      headers,
+      data: { passphrase: 'deliberately invalid passphrase' },
+    });
+    expect(limited.status()).toBe(429);
+    expect(Number(limited.headers()['retry-after'])).toBeGreaterThan(0);
+
+    const separateClient = await page.request.post('/api/login', {
+      headers: { 'x-forwarded-for': '203.0.113.91, 10.0.0.4' },
+      data: { passphrase: 'deliberately invalid passphrase' },
+    });
+    expect(separateClient.status()).toBe(401);
   });
 });
