@@ -63,6 +63,8 @@ test.describe.serial('Private Intake', () => {
     await expect(page.getByTestId('demo-worker-brief')).toContainText('18 Juniper Lane');
     await expect(page.getByTestId('demo-worker-brief')).not.toContainText('Nadia Patel');
     await expect(page.getByTestId('demo-worker-brief')).not.toContainText('Warranty account NW-204');
+    const demoAxe = await new AxeBuilder({ page }).analyze();
+    expect(demoAxe.violations.filter((item) => ['serious', 'critical'].includes(item.impact || ''))).toEqual([]);
     const firstId = await page.evaluate(() => sessionStorage.getItem('demo:private-intake:id'));
     await page.getByRole('button', { name: 'Reset demo' }).first().click();
     await expect.poll(() => page.evaluate(() => sessionStorage.getItem('demo:private-intake:id'))).not.toBe(firstId);

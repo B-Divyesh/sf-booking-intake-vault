@@ -48,6 +48,7 @@ p { max-width: 68ch; }
 main { min-height: calc(100vh - 270px); }
 .eyebrow { margin-bottom: 18px; color: var(--brass); font-size: .78rem; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; }
 .eyebrow.coral { color: var(--coral); }.eyebrow.green { color: var(--signal); }
+.booking-full .eyebrow.coral { color: #8e342f; }
 .lede { color: var(--mist); font-size: 1.14rem; line-height: 1.65; }
 .hero { width: min(100% - 40px, 1240px); margin: 72px auto 110px; display: grid; grid-template-columns: .86fr 1.14fr; align-items: center; gap: clamp(36px, 7vw, 90px); }
 .hero-copy h1 em { color: var(--brass); font-weight: 400; }
