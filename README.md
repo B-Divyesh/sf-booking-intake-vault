@@ -61,6 +61,8 @@ npm audit --audit-level=high
 
 `npm test` runs Vitest, Rust integration tests, and Playwright browser tests.
 The claim commands are listed in [`.factory/claims.json`](.factory/claims.json).
+`npm run test:e2e` builds the web client first, so each browser claim works in
+a clean checkout without a pre-existing `frontend/dist` directory.
 The production build creates `frontend/dist` and
 `target/release/booking-intake-vault`.
 

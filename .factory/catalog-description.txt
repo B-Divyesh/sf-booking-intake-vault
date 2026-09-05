@@ -1,0 +1,1 @@
+Collect client booking details and share only approved job information with assigned workers.
