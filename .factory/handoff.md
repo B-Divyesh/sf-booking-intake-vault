@@ -8,9 +8,9 @@ artifact before Playwright starts the Rust server. It passes from a fresh clone
 where `frontend/dist` does not exist.
 
 - Deployed implementation SHA: `0ad29bd64650c88b3f80e6f1e02b94d1d29c86c5`
-- Documentation: the later commit containing this handoff, catalog text, and
-  repair report is intentionally not rebuilt because it changes no product
-  runtime files.
+- Verification documentation SHA: `27b59b71c31551c0859ddddb187cbe9b8449a4f2`.
+  The later metadata-only commit that records this value is intentionally not
+  rebuilt because it changes no product runtime files.
 - Live URL: `https://booking-intake-vault.sociobot.in`
 - Live revision: `sf-booking-intake-vault--0000029`
 - Immutable image digest:

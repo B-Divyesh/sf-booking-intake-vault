@@ -5,6 +5,8 @@
 Verified on 2026-09-05 from a fresh clone of implementation commit
 `0ad29bd64650c88b3f80e6f1e02b94d1d29c86c5` and against
 `https://booking-intake-vault.sociobot.in`.
+The verification documentation commit is
+`27b59b71c31551c0859ddddb187cbe9b8449a4f2`; it is not the deployed image.
 
 ## Recorded defect
 
