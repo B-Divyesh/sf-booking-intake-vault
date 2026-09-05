@@ -1,4 +1,28 @@
 # Private Intake — repair 7 handoff
++
+
+## Independent QA update — 2026-09-05
+
+Independent verification of implementation `0ad29bd64650c88b3f80e6f1e02b94d1d29c86c5`
+from a fresh unbuilt clone passed all 17 declared claim commands, `npm test`
+(3 Vitest, 19 Rust, 20 Playwright), Svelte checks, format, strict Clippy,
+production build, high-severity audit, and diff check. The live free product,
+demo, offline reload, redaction, routes, metadata, accessibility, response
+policy, and rate limiting also passed.
+
+**Current QA verdict: FAIL, one high finding.** The advertised US$29 Route
+pass checkout at
+`https://api.sociobot.in/api/v1/products/booking-intake-vault/checkout`
+returns HTTP 404. The billing registration dependency must be completed and
+the real checkout/verified-license path retested before release acceptance.
+There are zero untested declared claims. The full report is
+`.factory/verification-7.md`.
+
+Live `/health` now reports documentation SHA
+`02450e0e403b80c2852afe3b2829fa11e6b74afe`; live entry JS/CSS hashes match a
+fresh build of implementation `0ad29bd`, so this is documentation identity
+drift rather than product-runtime drift.
+
 
 ## Result
 
